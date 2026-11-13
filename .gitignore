@@ -1,0 +1,31 @@
+# Local dependencies and package installer scratch files
+.pylibs/
+.wheels/
+.tmp/
+.tmp2/
+pip-*/
+.venv/
+venv/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+tests/_tmp/
+
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+config/config.yaml
+data/*
+!data/.gitkeep
+*.log
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

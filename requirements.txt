@@ -1,0 +1,6 @@
+﻿pyyaml>=6.0
+sqlalchemy>=2.0
+requests>=2.31
+playwright>=1.40
+ddddocr>=1.4.11
+typer>=0.9

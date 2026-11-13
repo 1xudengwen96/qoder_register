@@ -1,0 +1,128 @@
+# ============================================================
+# qoder_register 配置模板
+# 复制为 config/config.yaml 后按需修改
+# 所有密钥一律用 env:VAR_NAME 形式，禁止明文
+# ============================================================
+
+region: us                 # 默认出口地区：us / uk / jp / sg / de / hk
+concurrency: 1             # 领取阶段强制串行，不要改
+
+# ------------------------------------------------------------ 邮箱源
+mail:
+  # weighted: 按权重取；strict_priority: 按顺序优先耗尽；round_robin: 轮转
+  strategy: weighted
+  weights:
+    outlook_tag: 50
+    hotmail: 35
+    icloud_relay: 15
+  strict_priority_order: [icloud_relay, hotmail, outlook_tag]
+
+  # 路线 A：Outlook 主号 + tag（name+q001@outlook.com）
+  outlook_tag:
+    main_accounts:
+      - user: "main1@outlook.com"
+        password: "env:OUTLOOK_MAIN1_PW"
+        imap: "outlook.office365.com"
+      - user: "main2@outlook.com"
+        password: "env:OUTLOOK_MAIN2_PW"
+        imap: "outlook.office365.com"
+    tag_prefix: "q"
+    max_tags_per_account: 8
+
+  # 路线 B：Hotmail / Outlook 独立主号，CSV 列 email,password,imap_host,region
+  hotmail:
+    credentials_file: "data/hotmail_accounts.csv"
+
+  # 路线 C：iCloud「隐藏我的邮件」，统一转发到聚合邮箱
+  icloud_relay:
+    relay_addresses_file: "data/icloud_relay.txt"   # 一行一个 xxx@privaterelay.appleid.com
+    aggregator_imap:
+      user: "agg@outlook.com"
+      password: "env:AGG_IMAP_PW"
+      host: "outlook.office365.com"
+      port: 993
+    quota_total: 100
+
+# ------------------------------------------------------------ 指纹浏览器
+browser:
+  # backend: adspower | bitbrowser | camoufox | playwright
+  # playwright 是零依赖兜底，质量最低；真正跑量建议 adspower / bitbrowser
+  backend: "adspower"
+  headless: false
+  storage_root: "data/profiles"
+
+  adspower:
+    api_base: "http://127.0.0.1:50325"
+    group_id: "0"
+
+  bitbrowser:
+    api_base: "http://127.0.0.1:54345"
+
+  camoufox:
+    os_hint: "windows"
+
+# ------------------------------------------------------------ 注册
+register:
+  signup_url: "https://qoder.com/signup"
+  recaptcha_site_key: ""      # 从注册页 DOM 抓，抓到填这里
+  hcaptcha_site_key: ""
+  turnstile_site_key: ""
+
+verify:
+  timeout: 600
+  confirm_hosts: ["qoder.com", "qoder.sh"]
+
+# ------------------------------------------------------------ 打码平台
+captcha:
+  timeout: 180
+  providers:
+    local:
+      enabled: true            # 图片验证码走本地 ddddocr，零成本
+    yescaptcha:
+      api_key: "env:YESCAPTCHA_KEY"
+    "2captcha":
+      api_key: "env:TWOCAPTCHA_KEY"
+    capsolver:
+      api_key: "env:CAPSOLVER_KEY"
+  # 按任务类型排优先级：从左到右依次尝试，前一个失败自动降级
+  prefer:
+    image: [local, yescaptcha, "2captcha"]
+    recaptcha_v2: [capsolver, yescaptcha, "2captcha"]
+    recaptcha_v3: [capsolver, yescaptcha, "2captcha"]
+    hcaptcha: [capsolver, yescaptcha, "2captcha"]
+    turnstile: [capsolver, yescaptcha]
+
+# ------------------------------------------------------------ 设备重置
+device:
+  app_dir: ""                  # 留空自动探测 %APPDATA%\Qoder
+  backup_dir: "data/device_backup"
+  fake_hardware: false         # 生成假硬件 JSON；服务端做一致性校验时反而是破绽
+  # 可裁剪步骤：kill,machine_id,telemetry,cache,identity,advanced,login,hardware,chat
+  steps: [kill, machine_id, telemetry, cache, identity, advanced, login, hardware, chat]
+
+# ------------------------------------------------------------ 领取
+claim:
+  client_path: "C:\\Program Files\\Qoder\\Qoder.exe"
+  data_dir: ""                 # 留空自动探测
+  wait_credit_timeout: 120
+  capture_token: true
+  credit_probe_url: ""         # 抓包拿到的额度接口，填了才能精确核对积分
+
+# ------------------------------------------------------------ 代理
+proxy:
+  source: file
+  file: "data/proxies.txt"     # 每行 http://user:pass@host:port#us
+
+# ------------------------------------------------------------ 地区画像
+region_profiles:
+  us: { timezone: "America/New_York", locale: "en-US" }
+  uk: { timezone: "Europe/London", locale: "en-GB" }
+  jp: { timezone: "Asia/Tokyo", locale: "ja-JP" }
+  sg: { timezone: "Asia/Singapore", locale: "en-SG" }
+  de: { timezone: "Europe/Berlin", locale: "de-DE" }
+  hk: { timezone: "Asia/Hong_Kong", locale: "zh-HK" }
+
+# ------------------------------------------------------------ 存储
+storage:
+  url: "sqlite:///data/qoder.db"
+  artifacts_dir: "data/artifacts"
