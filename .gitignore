@@ -29,3 +29,7 @@ data/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本机密钥与运行参数
+config/secrets.yaml
+

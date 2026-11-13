@@ -1,33 +1,13 @@
-"""IPDEEP V2 开放 API 正确客户端（依据官方文档实测）。
+"""IPDEEP V2 account/region transport.
 
-关键修正（之前搞错的地方）
---------------------------
-1. **Action 名全小写**
-   错：``/openApi/V2/Account/GetBalance``
-   对：``/openApi/V2/Account/balance``
+Routes and PascalCase business fields follow the supplied official documentation.
+The documentation excerpt does NOT specify GenerateSign canonicalization, IV
+serialization, or a response test vector. Earlier MD5/IV-prefix guesses were
+not verified: Duplicate Request does not prove authentication passed.
 
-2. **业务参数 PascalCase**
-   错：``{"proxyType": "dynamicResidential"}``
-   对：``{"ProxyType": "dynamicResidential"}``
-
-3. **ResData 是加密字符串**，需要用同一把 AES key 解密：
-   Base64 → 前16字节是 IV → AES-CBC 解密 → PKCS7 去填充 → JSON
-
-4. **extractType 不需要传**。认证方式由账号配置决定：
-   先调 ``updateDynamicPassword`` 设置密码，之后提取的代理就是账密认证。
-
-已知接口
---------
-| 接口 | 说明 | 参数 |
-|---|---|---|
-| POST /openApi/V2/Account/balance | 账户余额 | 无 |
-| POST /openApi/V2/Account/traffic | 流量与静态IP数 | 无 |
-| POST /openApi/V2/DynamicProxy/countries | 支持的国家 | ProxyType |
-| POST /openApi/V2/DynamicProxy/states | 州/省 | ProxyType, CountryCode |
-| POST /openApi/V2/DynamicProxy/cities | 城市 | ProxyType, CountryCode, StateCode |
-| POST /openApi/V2/DynamicProxy/updateDynamicPassword | 改动态代理密码 | DynamicPassword |
-
-ProxyType 取值：``dynamicDataCenter`` / ``dynamicResidential`` / ``mobile``
+A verified official signer and codec must be supplied explicitly; without them
+requests fail locally rather than probing credentials or reporting false success.
+ProxyInfo also provides an independent, explicit proxy connectivity check.
 """
 
 from __future__ import annotations
@@ -38,6 +18,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -317,3 +298,122 @@ class IpdeepClient:
         """设置动态代理密码。设了之后提取的代理就是账密认证。"""
         return self.call("DynamicProxy", "updateDynamicPassword",
                          {"DynamicPassword": password})
+
+    # ---------------------------------------------------------- 提取代理
+    EXTRACT_ACTIONS = ("extractDynamicIP", "extract", "extractIps",
+                       "getDynamicIp", "generateDynamicIp")
+
+    def extract_proxies(self, *, proxy_type: str = "dynamicResidential",
+                        country: str = "", state: str = "", city: str = "",
+                        num: int = 1, protocol: str = "http",
+                        duration: int = 30, rotation: str = "stickiness",
+                        fmt: str = "info") -> list[ProxyInfo]:
+        """提取动态代理，返回可用代理列表。
+
+        接口名与业务字段在官方文档摘录里没有明写，这里按「动作名 × 字段命名风格」
+        依次试探，命中即返回；全失败时把每次的错误码一起抛出，便于定位。
+        """
+        base = {
+            "ProxyType": proxy_type, "Num": int(num), "Protocol": protocol,
+            "Duration": int(duration), "RotationType": rotation,
+            "Format": fmt,
+        }
+        for key, val in (("CountryCode", country), ("StateCode", state),
+                         ("CityCode", city)):
+            if val:
+                base[key] = val
+
+        camel = _to_camel(base)
+        attempts: list[tuple[str, dict]] = []
+        for action in self.EXTRACT_ACTIONS:
+            attempts.append((action, dict(base)))
+            attempts.append((action, dict(camel)))
+
+        errors: list[str] = []
+        for action, biz in attempts:
+            try:
+                res = self.call("DynamicProxy", action, biz)
+            except IpdeepError as exc:
+                errors.append(f"{action}/{','.join(sorted(biz))[:40]}: "
+                              f"{exc.code or '?'} {exc}")
+                continue
+            proxies = parse_proxy_payload(res)
+            if proxies:
+                return proxies
+            errors.append(f"{action}: 返回里解析不出代理 {str(res)[:80]}")
+        raise IpdeepError("提取失败，尝试过的组合：\n" + "\n".join(errors))
+
+
+def _to_camel(d: dict) -> dict:
+    """PascalCase → camelCase（有些接口按 DTO 序列化成小驼峰）。"""
+    out = {}
+    for k, v in d.items():
+        out[k[:1].lower() + k[1:]] = v
+    return out
+
+
+def parse_proxy_payload(payload: Any) -> list[ProxyInfo]:
+    """把提取结果解析成 ``ProxyInfo`` 列表。
+
+    兼容三种形态：
+    1. ``[{"Ip": "...", "Port": 8080, "Username": "...", "Password": "..."}]``
+    2. ``{"list": [...]}`` / ``{"data": [...]}``
+    3. 纯文本 ``ip:port:user:pass`` 或 ``user:pass@ip:port``，一行一个
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return parse_proxy_payload(json.loads(text))
+            except Exception:
+                return _parse_lines(text)
+        return _parse_lines(text)
+    if isinstance(payload, dict):
+        for key in ("list", "data", "List", "Data", "proxies", "Proxies",
+                    "items", "result"):
+            if isinstance(payload.get(key), (list, dict)):
+                got = parse_proxy_payload(payload[key])
+                if got:
+                    return got
+        info = ProxyInfo.from_dict(payload)
+        return [info] if info.host and info.port else []
+    if isinstance(payload, list):
+        out: list[ProxyInfo] = []
+        for item in payload:
+            if isinstance(item, dict):
+                got = parse_proxy_payload(item)
+                out.extend(got)
+            elif isinstance(item, str):
+                out.extend(_parse_lines(item))
+        return out
+    return []
+
+
+def _parse_lines(text: str) -> list[ProxyInfo]:
+    out: list[ProxyInfo] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            if "@" in line:
+                url = line if "://" in line else "http://" + line
+                u = urllib.parse.urlparse(url)
+                if u.hostname and u.port:
+                    out.append(ProxyInfo(
+                        host=u.hostname, port=int(u.port),
+                        username=urllib.parse.unquote(u.username or ""),
+                        password=urllib.parse.unquote(u.password or "")))
+                continue
+            parts = line.split(":")
+            if len(parts) == 4:
+                out.append(ProxyInfo(host=parts[0], port=int(parts[1]),
+                                     username=parts[2], password=parts[3]))
+            elif len(parts) == 2:
+                out.append(ProxyInfo(host=parts[0], port=int(parts[1])))
+        except (ValueError, TypeError):
+            continue
+    return out
+

@@ -97,29 +97,34 @@ async def run(index: int, headless: bool, stop_at_captcha: bool,
     try:
         async with async_playwright() as pw:
             if use_bb:
-                # 比特浏览器：静态代理模式
+                # 比特浏览器：环境里已配好代理（静态或 dynamicIpUrl），直接启动
                 from app.register.bitbrowser import (
                     BitBrowserClient,
                     build_fingerprint,
-                    build_proxy_fields,
+                    build_proxy_config,
                 )
 
                 bb_client = BitBrowserClient()
                 if not bb_client.is_port_open():
                     print("比特浏览器未运行")
                     return 2
-                fp = build_fingerprint(
-                    ua=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"),
-                )
-                env = bb_client.create_env(
-                    name=f"signup_{acc.email.split('@')[0][:12]}",
-                    fingerprint=fp,
-                    proxy_raw=bb_proxy or None,
-                    remark="qoder_signup",
-                )
-                print(f"比特浏览器环境: {env.id}")
+                if bb_env_id:
+                    env = bb_client.get_env(bb_env_id)
+                    print(f"比特浏览器复用环境: {env.id} ({env.name}) "
+                          f"proxyMethod={env.proxy_method} {env.host}:{env.port}")
+                else:
+                    fp = build_fingerprint(
+                        ua=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/155.0.8059.86 Safari/537.36"),
+                    )
+                    env = bb_client.create_env(
+                        name=f"signup_{acc.email.split('@')[0][:12]}",
+                        fingerprint=fp,
+                        proxy_raw=bb_proxy or None,
+                        remark="qoder_signup",
+                    )
+                    print(f"比特浏览器新环境: {env.id}")
                 launch = bb_client.open_env(env.id)
                 print(f"CDP: {launch.cdp_http}")
                 browser = await pw.chromium.connect_over_cdp(launch.cdp_http)
@@ -209,7 +214,9 @@ def main() -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--stop-at-captcha", action="store_true")
     ap.add_argument("--bitbrowser", action="store_true")
-    ap.add_argument("--proxy", default="", help="比特浏览器的静态代理")
+    ap.add_argument("--proxy", default="", help="比特浏览器的静态代理（新建环境时用）")
+    ap.add_argument("--env-id", default="", help="复用已配好代理的比特浏览器环境")
+    ap.add_argument("--keep-open", action="store_true", help="跑完不关浏览器")
     ap.add_argument("--captcha-key", default=os.environ.get("TWOCAPTCHA_KEY", ""),
                     help="2Captcha API Key")
     ap.add_argument("--no-paid", action="store_true",

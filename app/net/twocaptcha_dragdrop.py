@@ -73,16 +73,28 @@ class TwoCaptchaDragDrop:
         self.timeout = timeout
         self.poll = poll
 
-    def _post(self, url: str, payload: dict) -> dict:
-        proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-        try:
-            r = requests.post(url, json=payload, proxies=proxies, timeout=40)
-        except Exception as exc:
-            raise TwoCaptchaError(f"请求失败 {type(exc).__name__}: {exc}") from exc
-        try:
-            return r.json()
-        except Exception:
-            raise TwoCaptchaError(f"返回非 JSON: {r.text[:200]}")
+    def _post(self, url: str, payload: dict, retries: int = 3) -> dict:
+        """POST 到 2Captcha。代理失败自动回落直连，最多 3 次退避重试。
+
+        本机实测：本地 Clash 的节点偶发 `SSL: UNEXPECTED_EOF_WHILE_READING`，
+        一次失败就抛会让整轮注册白跑，所以这里分「先代理、后直连」两条腿。
+        """
+        last = ""
+        for attempt in range(retries + 1):
+            for label, px in (("代理", self.proxy), ("直连", None)):
+                if label == "直连" and not self.proxy:
+                    continue
+                proxies = {"http": px, "https": px} if px else None
+                try:
+                    r = requests.post(url, json=payload, proxies=proxies,
+                                      timeout=40)
+                    return r.json()
+                except Exception as exc:
+                    last = f"{label} {type(exc).__name__}: {exc}"
+                    continue
+            if attempt < retries:
+                time.sleep(2.0 * (attempt + 1))
+        raise TwoCaptchaError(f"请求失败（{retries + 1} 轮）: {last}")
 
     def balance(self) -> float:
         d = self._post(GET_BALANCE, {"clientKey": self.api_key})

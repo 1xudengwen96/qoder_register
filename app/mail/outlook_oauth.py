@@ -1,25 +1,11 @@
-"""Outlook/Outlook.com 邮箱客户端（OAuth2 + IMAP XOAUTH2）。
+"""Standalone Outlook OAuth2/IMAP reader.
 
-为什么不用 imaplib.authenticate()
---------------------------------
-``imaplib.authenticate()`` 会把回调返回值当 **literal** 发送：
+imaplib.authenticate() Base64-encodes callback bytes itself: supply the RAW
+XOAUTH2 SASL payload, never an already Base64-encoded value. Use the public
+API so tagged responses and the AUTH state are managed by imaplib.
 
-    AUTHENTICATE XOAUTH2 {123}
-    <base64>
-
-而 Microsoft 的 XOAUTH2 要求裸 base64 字符串：
-
-    AUTHENTICATE XOAUTH2
-    + （服务器要求继续）
-    <base64>
-
-格式不符会报 ``AUTHENTICATE command error: BAD [b'Command Argument Error. 12']``。
-
-所以这里手工控制协议流程：发 AUTHENTICATE → 等 ``+`` → 发 base64 → 读结果。
-
-邮箱清单格式（发货格式）
-------------------------
-    邮箱----密码----clientid----refresh_token----辅助邮箱----辅助邮箱密码
+The optional proxy configures HTTPS token requests only, not the IMAP TCP
+connection. Mail reads use BODY.PEEK[] and mailbox selection is read-only.
 """
 
 from __future__ import annotations
@@ -43,15 +29,106 @@ DEFAULT_SCOPE = ("https://outlook.office.com/IMAP.AccessAsUser.All "
 IMAP_HOST = "outlook.office365.com"
 
 
+def _split_proxy(proxy: str) -> tuple[str, int]:
+    """``http://user:pass@host:port`` → (host, port)。"""
+    raw = proxy.strip()
+    for scheme in ("http://", "https://", "socks5://"):
+        if raw.startswith(scheme):
+            raw = raw[len(scheme):]
+    raw = raw.split("@")[-1]
+    host, _, port = raw.partition(":")
+    return host or "127.0.0.1", int(port or 8080)
+
+
+def _ipv4_of(host: str, port: int) -> str:
+    """只取 A 记录。微软的 IPv6 段（2603:1016::/32）在本机关 TUN 后 TLS 握手超时。"""
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET,
+                                  socket.SOCK_STREAM)
+    except OSError:
+        return host
+    for info in infos:
+        return info[4][0]
+    return host
+
+
+class ProxiedIMAP4SSL(imaplib.IMAP4_SSL):
+    """强制 IPv4（可选走 HTTP CONNECT 隧道）的 IMAP4_SSL。
+
+    为什么要动 socket 层：
+    1. ``imaplib`` 不认 ``proxies``，永远直连。
+    2. 本机 DNS 优先返回 IPv6，``outlook.office365.com`` 的 AAAA
+       （2603:1016:...）TCP 能连上但 **TLS 握手必超时**；关闭 TUN 后 IPv6
+       路径就是断的。实测直连/隧道都是 ``handshake operation timed out``。
+    3. 所以这里一律解析 A 记录、按 IPv4 建立连接；隧道模式下把 IPv4 直接
+       写进 CONNECT 目标，避免代理端又去走 IPv6，SNI 仍用域名。
+
+    只覆盖 ``_create_socket()``，imaplib 的状态机与 XOAUTH2 手工认证逻辑不动。
+    """
+
+    def __init__(self, host: str, port: int = 993, *,
+                 proxy: str = "", ssl_context=None, timeout: int = 60) -> None:
+        self._proxy = proxy or ""
+        if self._proxy:
+            self._proxy_host, self._proxy_port = _split_proxy(self._proxy)
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout):          # noqa: D102
+        """建连。微软侧对同一出口的连接是抖的（前一次 0.5s 成功、下一次握手超时），
+        所以这里自己重试 3 轮，每轮都重新 CONNECT，别把抖动交给上层。"""
+        last: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                return self._connect_once(timeout)
+            except (OSError, TimeoutError) as exc:
+                last = exc
+                time.sleep(0.8 * attempt)
+        raise last if last else OSError("IMAP 建连失败")
+
+    def _connect_once(self, timeout):
+        limit = timeout or 60
+        if self._proxy:
+            # 走代理用**域名**：让代理端自己解析。
+            # 实测本机解析出的 40.104.x.x 在隧道里必被 EOF，而域名目标
+            # 直接 TLSv1.3 成功（代理端解析到的是可用节点）。
+            target = f"{self.host}:{self.port}"
+            raw = socket.create_connection(
+                (self._proxy_host, self._proxy_port), timeout=limit)
+            raw.settimeout(limit)
+            req = (f"CONNECT {target} HTTP/1.1\r\n"
+                   f"Host: {target}\r\n"
+                   f"Proxy-Connection: keep-alive\r\n\r\n")
+            raw.sendall(req.encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    raw.close()
+                    raise OSError(f"代理隧道被关闭（{target}）")
+                buf += chunk
+            status = buf.split(b"\r\n", 1)[0]
+            if b" 200" not in status:
+                raw.close()
+                raise OSError(f"代理隧道失败 {target}: {status!r}")
+            return self.ssl_context.wrap_socket(raw, server_hostname=self.host)
+
+        # 直连：IPv6 到微软 TLS 必挂，只能强制 IPv4
+        ipv4 = _ipv4_of(self.host, self.port)
+        raw = socket.create_connection((ipv4, self.port), timeout=limit)
+        raw.settimeout(limit)
+        return self.ssl_context.wrap_socket(raw, server_hostname=self.host)
+
+
+
 # ============================================================ 数据类
 @dataclasses.dataclass(slots=True)
 class MailAccount:
     email: str
-    password: str = ""
+    password: str = dataclasses.field(default="", repr=False)
     client_id: str = ""
-    refresh_token: str = ""
+    refresh_token: str = dataclasses.field(default="", repr=False)
     recovery_email: str = ""
-    recovery_password: str = ""
+    recovery_password: str = dataclasses.field(default="", repr=False)
     extra: dict = dataclasses.field(default_factory=dict)
 
     @property
@@ -61,8 +138,8 @@ class MailAccount:
 
 @dataclasses.dataclass(slots=True)
 class TokenBundle:
-    access_token: str
-    refresh_token: str = ""
+    access_token: str = dataclasses.field(repr=False)
+    refresh_token: str = dataclasses.field(default="", repr=False)
     expires_in: int = 3600
     token_type: str = "Bearer"
     scope: str = ""
@@ -201,11 +278,16 @@ class OutlookMailbox:
             "scope": self.scope,
         }
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-        r = requests.post(TOKEN_URL, data=data, proxies=proxies, timeout=self.timeout)
-        j = r.json()
+        try:
+            r = requests.post(TOKEN_URL, data=data, proxies=proxies, timeout=self.timeout)
+            j = r.json()
+        except (requests.RequestException, ValueError):
+            raise RuntimeError("OAuth token endpoint transport/JSON failure") from None
+        if not isinstance(j, dict):
+            raise RuntimeError("OAuth token endpoint returned invalid response")
         if "access_token" not in j:
             raise RuntimeError(
-                f"换 token 失败：{j.get('error')} - {j.get('error_description', '')[:150]}")
+                f"OAuth token rejected (HTTP {r.status_code})")
         tb = TokenBundle(
             access_token=j["access_token"],
             refresh_token=j.get("refresh_token", ""),
@@ -221,45 +303,51 @@ class OutlookMailbox:
 
     # ---------------------------------------------------------- IMAP
     def _xoauth2(self, conn: imaplib.IMAP4_SSL) -> None:
-        """手工 XOAUTH2 认证（避开 imaplib 的 literal 格式问题）。"""
-        token = self.token.access_token if self.token else ""
-        auth_str = f"user={self.acc.email}\x01auth=Bearer {token}\x01\x01"
-        b64 = base64.b64encode(auth_str.encode()).decode()
+        """Supply RAW SASL bytes; imaplib handles Base64 and AUTH state."""
+        if self.token is None or not self.token.access_token:
+            raise RuntimeError("OAuth access token is missing")
+        user, token = self.acc.email, self.token.access_token
+        if any(c in user + token for c in ("\r", "\n", "\x01")):
+            raise ValueError("Invalid control character in OAuth credentials")
+        raw = f"user={user}\x01auth=Bearer {token}\x01\x01".encode("utf-8")
+        sent = False
 
-        tag = conn._new_tag().decode() if isinstance(conn._new_tag(), bytes) else conn._new_tag()
-        conn.send(f"{tag} AUTHENTICATE XOAUTH2\r\n".encode())
+        def response(challenge: bytes) -> bytes:
+            nonlocal sent
+            if sent:
+                return b""
+            sent = True
+            return raw
 
-        # 读 continuation
-        line = conn.readline()
-        if not line.startswith(b"+"):
-            raise RuntimeError(f"服务器未要求继续：{line[:120]}")
-
-        conn.send(f"{b64}\r\n".encode())
-        resp = conn.readline()
-
-        if b"OK" in resp.upper():
-            self._authed_tag = tag
-            # 关键：手工认证绕过了 imaplib 的 authenticate()，
-            # 它内部状态机还停在 NONAUTH，会导致后续 SELECT 报
-            # "command SELECT illegal in state NONAUTH"。
-            # 认证成功后手动推进状态。
-            conn.state = "AUTH"
-            return
-        # 解析错误
-        err = resp.decode("utf-8", "ignore")[:200]
         try:
-            import base64 as b2
-            payload = b2.b64decode(err.split()[-1])
-            err = payload.decode("utf-8", "ignore")
-        except Exception:
-            pass
-        raise RuntimeError(f"XOAUTH2 认证失败：{err}")
+            conn.authenticate("XOAUTH2", response)
+        except imaplib.IMAP4.error:
+            raise RuntimeError("IMAP XOAUTH2 authentication rejected") from None
 
     def connect(self) -> "OutlookMailbox":
         if self.token is None or self.token.expired:
             self.refresh_access_token()
-        conn = imaplib.IMAP4_SSL(self.host, 993, timeout=self.timeout)
-        self._xoauth2(conn)
+        # 隧道优先（代理端解析域名，实测 0.3s 建好）；没代理或隧道失败再直连 IPv4
+        try:
+            if self.proxy:
+                conn = ProxiedIMAP4SSL(self.host, 993, proxy=self.proxy,
+                                       timeout=self.timeout)
+            else:
+                conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
+                                       timeout=self.timeout)
+        except Exception:
+            if not self.proxy:
+                raise
+            conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
+                                   timeout=self.timeout)
+        try:
+            self._xoauth2(conn)
+        except Exception:
+            try:
+                conn.logout()
+            except Exception:
+                conn.shutdown()
+            raise
         self._conn = conn
         return self
 
@@ -281,7 +369,7 @@ class OutlookMailbox:
     # ---------------------------------------------------------- 读信
     def select(self, box: str = "INBOX") -> int:
         assert self._conn is not None
-        typ, data = self._conn.select(box)
+        typ, data = self._conn.select(box, readonly=True)
         if typ != "OK":
             raise RuntimeError(f"选择邮箱失败：{data}")
         return int(data[0])
@@ -295,7 +383,7 @@ class OutlookMailbox:
 
     def fetch(self, uid: bytes) -> MailMsg | None:
         assert self._conn is not None
-        typ, data = self._conn.uid("FETCH", uid, "(RFC822)")
+        typ, data = self._conn.uid("FETCH", uid, "(BODY.PEEK[])")
         if typ != "OK" or not data:
             return None
         raw = None
@@ -373,10 +461,10 @@ def check_account(acc: MailAccount, proxy: str | None = None) -> dict:
         return out
     try:
         box.connect()
-        out["imap_ok"] = True
         count = box.select("INBOX")
         out["inbox_count"] = count
         uids = box.list_uids()
+        out["imap_ok"] = True
         if uids:
             msg = box.fetch(uids[-1])
             if msg:

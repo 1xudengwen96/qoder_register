@@ -45,9 +45,17 @@ import base64
 import io
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 from PIL import Image
+
+try:                                   # 本机可能没装 opencv
+    import cv2
+    _CV2_NOTE = "cv2"
+except ImportError:                    # 退回 numpy 实现，结果等价
+    cv2 = None
+    _CV2_NOTE = "numpy"
+
+from app.register import template_match
 
 # 三法一致时的最小置信度
 MIN_CONF = 0.55
@@ -220,6 +228,59 @@ def _match_with_uniqueness(bg_bgr: np.ndarray, pz_bgr: np.ndarray,
     return None
 
 
+def _match_with_uniqueness_np(bg_rgb: np.ndarray, pz_rgb: np.ndarray,
+                              mask01: np.ndarray, mode: str,
+                              y_center: int | None = None,
+                              y_span: int = 24
+                              ) -> tuple[int, int, float, float, float] | None:
+    """numpy 版（无 cv2 时使用）。公式与 OpenCV 掩膜归一化一致。"""
+    try:
+        if mode == "ccorr-color":
+            r = template_match.match_masked(bg_rgb, pz_rgb, mask01, "ccorr")
+            r = np.nan_to_num(r, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            r = _restrict_y(r, y_center, y_span)
+            best, second = _peak_uniqueness(r)
+            my, mx = np.unravel_index(int(np.argmax(r)), r.shape)
+            return int(mx), int(my), float(max(0.0, best)), best, second
+
+        bg_g = template_match.to_gray(bg_rgb)
+        pz_g = template_match.to_gray(pz_rgb)
+
+        if mode == "ccorr-gray":
+            r = template_match.match_masked(bg_g, pz_g, mask01, "ccorr")
+            r = np.nan_to_num(r, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            r = _restrict_y(r, y_center, y_span)
+            best, second = _peak_uniqueness(r)
+            my, mx = np.unravel_index(int(np.argmax(r)), r.shape)
+            return int(mx), int(my), float(max(0.0, best)), best, second
+
+        if mode == "sqdiff-gray":
+            r = template_match.match_masked(bg_g, pz_g, mask01, "sqdiff")
+            r = np.nan_to_num(r, nan=1.0, posinf=1.0, neginf=1.0)
+            r = _restrict_y(r, y_center, y_span, worst=1.0)
+            rinv = 1.0 - r
+            best, second = _peak_uniqueness(rinv)
+            my, mx = np.unravel_index(int(np.argmin(r)), r.shape)
+            mn = float(r[my, mx])
+            return int(mx), int(my), float(max(0.0, 1.0 - mn)), best, second
+    except Exception:
+        return None
+    return None
+
+
+def _match(bg_rgb: np.ndarray, pz_rgb: np.ndarray, mask01: np.ndarray,
+           mode: str, y_center: int | None = None,
+           y_span: int = 24) -> tuple[int, int, float, float, float] | None:
+    """按环境选后端：有 opencv 用 opencv，没有就走 numpy。"""
+    if cv2 is not None:
+        bg_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+        pz_bgr = cv2.cvtColor(pz_rgb, cv2.COLOR_RGB2BGR)
+        mask = (mask01 * 255).astype(np.uint8)
+        return _match_with_uniqueness(bg_bgr, pz_bgr, mask, mode, y_center, y_span)
+    return _match_with_uniqueness_np(bg_rgb, pz_rgb, mask01, mode,
+                                     y_center, y_span)
+
+
 def _restrict_y(r: np.ndarray, y_center: int | None, y_span: int,
                 worst: float = -1.0) -> np.ndarray:
     """把 y 范围外的响应值压到最低。"""
@@ -269,18 +330,18 @@ def find_gap(bg: Image.Image, piece: Image.Image,
                          detail=f"拼图块接近纯色 std={pz_std:.1f}，无法匹配",
                          scale=scale, piece_w=pw, piece_h=ph)
 
-    bg_bgr = cv2.cvtColor(np.array(bg.convert("RGB")), cv2.COLOR_RGB2BGR)
-    pz_bgr = cv2.cvtColor(np.array(pz_rgb), cv2.COLOR_RGB2BGR)
-    mask = (m.astype(np.uint8)) * 255
+    bg_rgb = np.array(bg.convert("RGB"))
+    pz_np = np.array(pz_rgb)
+    mask01 = m.astype(np.float32)
 
-    bh, bw = bg_bgr.shape[:2]
+    bh, bw = bg_rgb.shape[:2]
     if ph > bh or pw > bw:
         return GapResult(False, detail=f"模板 {pw}x{ph} 超出背景 {bw}x{bh}",
                          scale=scale, piece_w=pw, piece_h=ph)
 
     cands: list[dict] = []
     for mode in ("ccorr-color", "ccorr-gray", "sqdiff-gray"):
-        got = _match_with_uniqueness(bg_bgr, pz_bgr, mask, mode)
+        got = _match(bg_rgb, pz_np, mask01, mode)
         if got:
             x, y, conf, best, second = got
             cands.append({"mode": mode, "x": x, "y": y, "conf": conf,

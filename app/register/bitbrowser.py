@@ -104,6 +104,16 @@ class RateLimitedError(BitBrowserError):
     """本地 API 限流。"""
 
 
+# ============================================================ 常量
+# /browser/update 必须回传的代理字段（漏一个就报「请传入 proxyMethod」）
+PROXY_FIELDS = (
+    "proxyMethod", "proxyType", "host", "port",
+    "proxyUserName", "proxyPassword", "enableSocks5Udp",
+    "dynamicIpUrl", "isDynamicIpChangeIp", "ipCheckService",
+    "isIpNoChange", "refreshProxyUrl",
+)
+
+
 # ============================================================ 数据类
 @dataclass(slots=True)
 class BitBrowserEnv:
@@ -156,15 +166,26 @@ class LaunchResult:
     @property
     def cdp_http(self) -> str:
         """Playwright connect_over_cdp 用的地址。"""
-        if self.http.startswith("http"):
+        if not self.http:
+            return ""
+        if self.http.startswith(("http://", "https://")):
             return self.http
         return f"http://{self.http}"
 
     @property
     def cdp_ws(self) -> str:
-        if self.ws.startswith("ws"):
+        if not self.ws:
+            return ""
+        if self.ws.startswith(("ws://", "wss://")):
             return self.ws
         return f"ws://{self.ws}"
+
+    @property
+    def cdp_endpoint(self) -> str:
+        endpoint = self.cdp_http or self.cdp_ws
+        if not endpoint:
+            raise BitBrowserError("Missing CDP endpoint")
+        return endpoint
 
 
 # ============================================================ 指纹构造
@@ -297,37 +318,34 @@ class BitBrowserClient:
 
     def call(self, path: str, body: dict | None = None,
              timeout: int | None = None, retries: int = 2) -> dict:
-        self._throttle()
-        last_err = ""
+        if not path.startswith("/") or "://" in path:
+            raise ValueError("Expected local API path")
         for attempt in range(retries + 1):
+            self._throttle()
             try:
                 r = requests.post(self.base + path, json=body or {},
                                   headers=self._headers(),
                                   timeout=timeout or self.timeout)
+                r.raise_for_status()
                 data = r.json()
-            except requests.exceptions.ConnectionError as exc:
-                raise BitBrowserError(f"连不上比特浏览器本地服务 {self.base}：{exc}") from exc
-            except json.JSONDecodeError:
-                raise BitBrowserError(f"{path} 返回非 JSON：{r.text[:200]}")
-
-            if data.get("success"):
+            except (requests.RequestException, ValueError):
+                raise BitBrowserError(f"{path}: HTTP/transport/JSON failure") from None
+            if not isinstance(data, dict):
+                raise BitBrowserError(f"{path}: expected response object")
+            if data.get("success") is True:
                 return data
-
-            msg = data.get("msg") or ""
-            if "请求频繁" in msg and attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
-                last_err = msg
-                continue
+            msg = str(data.get("msg") or "")
+            if "请求频繁" in msg:
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RateLimitedError("Local API rate limited")
             if "窗口被限制打开" in msg:
                 raise LaunchRestrictedError(
-                    "窗口被限制打开（code 11018）：当前账号 RPA 并发为 0。"
-                    "需在比特浏览器客户端开通 RPA/API 并发额度。",
-                    code=11018, raw=data,
-                )
-            if "请求频繁" in msg:
-                raise RateLimitedError(f"本地 API 限流：{msg}", raw=data)
-            raise BitBrowserError(msg or f"{path} 调用失败", raw=data)
-        raise BitBrowserError(last_err or "重试耗尽")
+                    "Browser launch restricted; check client permissions and limits",
+                    code=data.get("code"))
+            raise BitBrowserError(f"{path}: API rejected request", code=data.get("code"))
+        raise BitBrowserError("Retries exhausted")
 
     # ---------------------------------------------------------- 健康
     def health(self) -> bool:
@@ -396,10 +414,22 @@ class BitBrowserClient:
         return BitBrowserEnv.from_api(d)
 
     def update_env(self, env_id: str, **fields) -> BitBrowserEnv:
-        """修改环境。必须带 ``browserFingerPrint``（实测强制要求）。"""
+        """修改环境。
+
+        实测两个强制项：
+        - 必须带 ``browserFingerPrint``
+        - 必须带 ``proxyMethod``（显式传或从现有配置继承），
+          否则报 ``请传入 proxyMethod``，code 为 null
+        """
         current = self.get_env(env_id).raw
         fp = fields.pop("browserFingerPrint", None) or current.get("browserFingerPrint") or {}
-        body = {"id": env_id, "browserFingerPrint": fp}
+        body: dict = {"id": env_id, "browserFingerPrint": fp}
+        for key in PROXY_FIELDS:
+            if key in fields:
+                continue
+            val = current.get(key)
+            if val is not None:
+                body[key] = val
         body.update(fields)
         d = self.call("/browser/update", body, timeout=90).get("data") or {}
         return BitBrowserEnv.from_api(d)
@@ -470,8 +500,12 @@ class BitBrowserClient:
         return self.call("/browser/fingerprint/random", {"browserId": env_id}).get("data") or {}
 
     def list_groups(self, page: int = 0, page_size: int = 100) -> list[dict]:
-        d = self.call("/group/list", {"page": page, "pageSize": page_size}).get("data") or {}
-        return d.get("list") or (d if isinstance(d, list) else [])
+        d = self.call("/group/list", {"page": page, "pageSize": page_size}).get("data")
+        if isinstance(d, list):
+            return d
+        if isinstance(d, dict):
+            return d.get("list") or []
+        raise BitBrowserError("Invalid groups response")
 
     # ---------------------------------------------------------- CDP 自检
     def probe_cdp(self, endpoint: str, timeout: int = 5) -> dict | None:
@@ -479,12 +513,16 @@ class BitBrowserClient:
         url = endpoint if endpoint.startswith("http") else f"http://{endpoint}"
         try:
             r = requests.get(url.rstrip("/") + "/json/version", timeout=timeout)
-            return r.json()
-        except Exception:
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("webSocketDebuggerUrl"):
+                return data
+            return None
+        except (requests.RequestException, ValueError):
             return None
 
     # ---------------------------------------------------------- 能力自检
-    def capability_report(self) -> dict:
+    def capability_report(self, allow_lifecycle: bool = False) -> dict:
         """一次性把所有能力探测清楚，给 CLI 用。"""
         rep: dict[str, Any] = {
             "base": self.base,
@@ -513,6 +551,11 @@ class BitBrowserClient:
         except BitBrowserError as exc:
             rep["launch_error"] = f"列表失败：{exc}"
 
+        # Default diagnostics are read-only. Lifecycle probe must be explicit.
+        if not allow_lifecycle:
+            rep["lifecycle_tested"] = False
+            return rep
+        rep["lifecycle_tested"] = True
         # 用一个临时环境试启动，测完删掉
         try:
             fp = build_fingerprint(ua=(
