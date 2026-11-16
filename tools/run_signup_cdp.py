@@ -209,6 +209,20 @@ def main() -> int:
             else CDPPage(endpoint)
         print(f"CDP 已接管: {endpoint}")
 
+        # 每轮清一次浏览器状态，保证是全新身份（客户端配置改不动，CDP 直接清最稳）
+        try:
+            page.cdp.call("Network.enable")
+            page.cdp.call("Network.clearBrowserCookies")
+            for origin in ("https://qoder.com", "https://www.qoder.com"):
+                try:
+                    page.cdp.call("Storage.clearDataForOrigin", {
+                        "origin": origin, "storageTypes": "all"})
+                except Exception:
+                    pass
+            print("已清 cookie / localStorage / sessionStorage")
+        except Exception as exc:
+            print(f"清理浏览器状态失败（继续）: {type(exc).__name__}: {exc}")
+
         def code_provider() -> str:
             if relay is not None:
                 from app.mail.base import MailIdentity
@@ -265,6 +279,22 @@ def main() -> int:
                 source=("icloud_relay" if relay else "outlook"))
             print(f"\n已保存账号 -> {saved['jsonl']}  (db_id={saved['db_id']})")
             print(f"           -> {saved['txt']}")
+
+            # 立刻抓会话凭据（环境启动时清 cookie，浏览器一关登录态就没了）
+            try:
+                from app.register.webtoken import save_session, snapshot_session
+
+                snap = snapshot_session(flow.page.cdp)
+                sess = save_session(rep.result.email, snap)
+                print(f"会话凭据: api_ok={snap.get('api_ok')} "
+                      f"uid={snap.get('uid')} "
+                      f"cookie={len(snap.get('session_cookie') or '')}B "
+                      f"db_id={sess['db_id']}")
+                for p in (snap.get("probe") or [])[:3]:
+                    print(f"  {p.get('status')} {p.get('path')} "
+                          f"{(p.get('body') or '')[:100]}")
+            except Exception as exc:
+                print(f"抓会话凭据失败: {type(exc).__name__}: {exc}")
 
         print("\n=== 阶段 ===")
         for st in rep.stages:

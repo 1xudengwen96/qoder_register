@@ -140,6 +140,35 @@ JS_GRAB_SRCS = r"""(async () => {
 })()"""
 
 
+JS_INJECT_IMAGES = r"""(args) => {
+  const set = (sel, url) => {
+    const e = document.querySelector(sel);
+    if (!e) return 'no-el';
+    e.src = url;
+    return 'set';
+  };
+  return {img: set('#aliyunCaptcha-img', args.bg),
+          puzzle: set('#aliyunCaptcha-puzzle', args.pz)};
+}"""
+
+JS_ARMED = """(() => {
+  const s = document.querySelector('#aliyunCaptcha-sliding-slider');
+  if (!s) return false;
+  const cls = String(s.className || '');
+  const pe = getComputedStyle(s).pointerEvents;
+  return !/initial/.test(cls) && pe !== 'none';
+})()"""
+
+
+def _img_to_data_url(img) -> str:
+    import base64
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 @dataclass(slots=True)
 class SolveResult:
     ok: bool
@@ -208,6 +237,26 @@ class AliyunSliderCDP:
         self._d(f"滑块窗口没起来 state={st} img={img_ok}")
         return False
 
+    def heal_images(self, bg, pz) -> bool:
+        """把图注入回 ``<img>``，逼组件进入可拖状态。
+
+        比特浏览器会拦 ``<img>`` 的加载（naturalWidth 恒 0），组件因此一直
+        停在 ``pointer-events:none`` / ``slider-move initial``，怎么拖都没反应。
+        我们已经在 Python 侧拿到了图，直接以 dataURL 注回去。
+        """
+        import json as _json
+
+        try:
+            args = {"bg": _img_to_data_url(bg), "pz": _img_to_data_url(pz)}
+            out = self.page.eval(f"({JS_INJECT_IMAGES})({_json.dumps(args)})")
+            self._d(f"注入图片: {out}")
+        except Exception as exc:
+            self._d(f"注入失败: {type(exc).__name__}: {exc}")
+            return False
+        ok = self.page.wait_js(JS_ARMED, timeout=8)
+        self._d(f"滑块已 arm: {ok}")
+        return ok
+
     # ---------------------------------------------------------- 取图
     def grab_images(self, wait_src: float = 15.0):
         """取背景图与拼图块。
@@ -246,8 +295,9 @@ class AliyunSliderCDP:
         return None
 
     # ---------------------------------------------------------- 识别
-    def identify(self):
-        got = self.grab_images()
+    def identify(self, got=None, prefer_local: bool = False):
+        if got is None:
+            got = self.grab_images()
         if got is None:
             return None
         bg, pz, _data = got
@@ -262,31 +312,48 @@ class AliyunSliderCDP:
         self._d(f"图宽 {bg_w} 显示宽 {disp_w:.0f} scale={scale:.3f} "
                 f"拼图 {pw}x{pz_c.size[1]}")
 
-        if self.prefer_paid:
+        def _paid():
+            if not self.prefer_paid:
+                return None
             try:
                 sol = self.paid.solve(bg, pz_c)
                 if sol.ok:
                     self.total_cost += sol.cost
-                    # 2Captcha 给的是拼图块目标中心 x（自然像素），换到显示坐标
-                    x_left = (sol.x - pw / 2.0) * scale
+                    # 2Captcha 的 x 语义实测有歧义：可能给「拼图块中心」，
+                    # 也可能给「目标左沿」。两种解释交替试。
+                    self._paid_variant = getattr(self, "_paid_variant", 0) + 1
+                    if self._paid_variant % 2 == 1:
+                        x_left = (sol.x - pw / 2.0) * scale
+                        how = "center"
+                    else:
+                        x_left = sol.x * scale
+                        how = "left-edge"
                     limit = max(0.0, disp_w - pw * scale)
                     x_left = min(max(0.0, x_left), limit)
                     dy = abs(sol.y - bbox_y)
                     self._d(f"2Captcha 中心 x={sol.x:.0f} y={sol.y:.0f} "
-                            f"(bbox_y={bbox_y} dy={dy:.0f}) → 左沿 {x_left:.1f}"
-                            f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}")
-                    return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
+                            f"(bbox_y={bbox_y} dy={dy:.0f}) [{how}] "
+                            f"→ 左沿 {x_left:.1f} 耗时={sol.elapsed:.1f}s "
+                            f"cost=${sol.cost:.4f}")
+                    return x_left, f"2captcha({how},c={sol.x:.0f})", sol.cost
                 self._d(f"2Captcha 失败: {sol.error}")
             except Exception as exc:
                 self._d(f"2Captcha 异常: {type(exc).__name__}: {exc}")
-            if not self.local_fallback:
-                self._d("付费识别未拿到坐标，按配置不回落本地")
-                return None
+            return None
 
-        gap = captcha_vision.find_gap(bg, pz, display_w=disp_w)
-        if gap.ok:
-            return gap.x_display, f"local-{gap.method}", 0.0
-        self._d(f"本地识别失败: {gap.detail}")
+        def _local():
+            gap = captcha_vision.find_gap(bg, pz, display_w=disp_w)
+            if gap.ok:
+                return gap.x_display, f"local-{gap.method}", 0.0
+            self._d(f"本地识别失败: {gap.detail}")
+            return None
+
+        # 两个来源实测会差 40px 左右，交替优先，命中率更高
+        order = (_local, _paid) if prefer_local else (_paid, _local)
+        for fn in order:
+            ident = fn()
+            if ident:
+                return ident
         return None
 
     # ---------------------------------------------------------- 拖拽
@@ -332,24 +399,39 @@ class AliyunSliderCDP:
                 time.sleep(random.uniform(0.02, 0.05))
 
         cur_x = sx
-        # ---- 开环拖动：真人节奏（1.1~1.9s，缓入缓出，中途小停顿）----
+        # ---- 开环拖动：有机轨迹（变速 + 停顿 + 轻微过冲回拉）----
         total = max(-track_w, min(track_w, target_left * ratio))
-        duration = random.uniform(1.1, 1.9)
-        steps = max(40, int(abs(total) / 2))
-        pause_at = random.randint(int(steps * 0.55), int(steps * 0.8))
-        self._d(f"开环拖动 total={total:.1f}px steps={steps} "
-                f"dur={duration:.2f}s ratio={ratio:.2f}")
+        self._d(f"开环拖动 total={total:.1f}px ratio={ratio:.2f}")
+
+        # 按下后先停顿（真人会犹豫）
+        time.sleep(random.uniform(0.25, 0.6))
+
+        overshoot = random.uniform(1.5, 4.0) if abs(total) > 40 else 0.0
+        target_x = sx + total + (overshoot if total > 0 else -overshoot)
+        steps = max(30, int(abs(total) / 1.6))
+        base_dt = random.uniform(0.010, 0.022)
         for i in range(1, steps + 1):
             t = i / steps
-            eased = t * t * (3 - 2 * t)          # ease-in-out
-            x = sx + total * eased
+            eased = t * t * (3 - 2 * t)
+            x = sx + (target_x - sx) * eased
             if self.human:
-                x += random.uniform(-0.35, 0.35)
+                x += random.uniform(-0.5, 0.5)
             cur_x = x
-            self.page.move(cur_x, sy + random.uniform(-0.4, 0.4), buttons=1)
-            time.sleep(duration / steps * random.uniform(0.75, 1.25))
-            if i == pause_at:
-                time.sleep(random.uniform(0.08, 0.16))   # 中途迟疑
+            self.page.move(cur_x, sy + random.uniform(-0.5, 0.5), buttons=1)
+            # 变速：偶尔快、偶尔慢、偶尔停一帧
+            dt = base_dt * random.choice((0.5, 0.8, 1.0, 1.0, 1.4, 2.2))
+            time.sleep(dt)
+            if random.random() < 0.06:
+                time.sleep(random.uniform(0.03, 0.09))
+
+        # 回拉到目标位（过冲修正）
+        if overshoot:
+            pull_steps = random.randint(3, 6)
+            for i in range(1, pull_steps + 1):
+                x = target_x - (overshoot if total > 0 else -overshoot) * i / pull_steps
+                cur_x = x
+                self.page.move(cur_x, sy + random.uniform(-0.3, 0.3), buttons=1)
+                time.sleep(random.uniform(0.02, 0.05))
 
         # ---- 闭环修正：只有 style.left 真的在变时才用（新版本可能不写它）----
         for _ in range(24):
@@ -394,7 +476,17 @@ class AliyunSliderCDP:
                 time.sleep(2)
                 continue
 
-            ident = self.identify()
+            got = self.grab_images()
+            if got is None:
+                res.detail = "取图失败"
+                self.refresh()
+                continue
+            bg0, pz0, _d0 = got
+            # 组件没 arm（pointer-events:none / slider-move initial）时，把图注回去
+            if not self.page.wait_js(JS_ARMED, timeout=1):
+                self.heal_images(bg0, pz0)
+
+            ident = self.identify(got, prefer_local=(attempt % 2 == 0))
             if ident is None:
                 res.detail = "识别失败"
                 self.refresh()
@@ -404,11 +496,6 @@ class AliyunSliderCDP:
             res.target_x, res.method = target, method
             res.cost += cost
 
-            got = self.grab_images()
-            if got is None:
-                res.detail = "取图失败"
-                self.refresh()
-                continue
             data = got[2]
 
             aligned, final_left = self.drag_to(target, data)
