@@ -28,6 +28,7 @@ class MailProviderEnum(str, enum.Enum):
     OUTLOOK_TAG = "outlook_tag"
     HOTMAIL = "hotmail"
     ICLOUD_RELAY = "icloud_relay"
+    OUTLOOK_FILE = "outlook_file"
 
 
 class MailStatus(str, enum.Enum):

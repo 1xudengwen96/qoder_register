@@ -341,67 +341,105 @@ class QoderSignupCDP:
         return True
 
     # ---------------------------------------------------------- ④
+    JS_OTP_FILL = """(() => {
+  const e = document.querySelector(%s);
+  if (!e) return 'no-input';
+  const code = %s;
+  e.focus();
+  const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value').set;
+
+  // 1) 原生 setter + 带 inputType/data 的 InputEvent
+  setter.call(e, '');
+  e.dispatchEvent(new InputEvent('input', {bubbles: true,
+      inputType: 'deleteContentBackward'}));
+  setter.call(e, code);
+  e.dispatchEvent(new InputEvent('input', {bubbles: true, cancelable: true,
+      inputType: 'insertText', data: code}));
+  e.dispatchEvent(new Event('change', {bubbles: true}));
+
+  // 2) 直接调 React 的 onChange —— 受控组件只有这条 100% 生效
+  const rkey = Object.keys(e).find(k => k.startsWith('__reactProps$'));
+  let fired = false, err = '';
+  if (rkey) {
+    const props = e[rkey];
+    if (props && typeof props.onChange === 'function') {
+      try {
+        props.onChange({target: e, currentTarget: e, bubbles: true,
+                        nativeEvent: new Event('change')});
+        fired = true;
+      } catch (ex) { err = String(ex).slice(0, 80); }
+    }
+  }
+  return JSON.stringify({value: String(e.value || ''), fired: fired,
+                         err: err, reactKey: !!rkey});
+})()"""
+
     def _otp_selector(self) -> str:
         for sel in OTP_SELECTORS:
             if self.page.exists(sel):
                 return sel
         return ""
 
-    def fill_otp(self, code: str) -> bool:
-        """把 6 位验证码打进 OTP 框，并确保 React 感知到。"""
+    def fill_otp(self, code: str) -> str:
+        """把 6 位码灌进 OTP 框：真键盘 → 原生 setter → 直接调 React onChange。
+
+        返回最终使用的选择器；空串表示没找到框。
+        """
         digits = [c for c in code if c.isdigit()][:6]
         if len(digits) < 6:
             self._d(f"验证码不完整: {code}")
-            return False
+            return ""
         sel = self._otp_selector()
         if not sel:
             self._d("找不到 OTP 输入框")
-            return False
+            return ""
+        target = "".join(digits)
         s = json.dumps(sel)
 
-        # 1) 聚焦 + 清空
-        self.page.focus(sel) if False else self.page.click(sel, human=self.human)
+        # 1) 真键盘逐字符（先让组件进入可输入状态）
+        self.page.click(sel, human=self.human)
         self._sleep(0.2, 0.4)
         self.page.clear(sel)
         self._sleep(0.15, 0.3)
-
-        # 2) 逐字符真实键盘事件
         for ch in digits:
             self.page.type_text(ch, delay=(0.05, 0.12))
             time.sleep(random.uniform(0.05, 0.14))
-        self._sleep(0.5, 0.9)
-        val = self.page.value(sel)
-        self._d(f"键盘输入后 value={val}")
+        self._sleep(0.4, 0.7)
+        self._d(f"键盘输入后 value={self.page.value(sel)}")
 
-        # 3) 原生 setter + input/change（点 React 受控 state）
-        if val != "".join(digits):
-            self.page.eval("""(() => {
-              const e = document.querySelector(%s);
-              if (!e) return false;
-              const setter = Object.getOwnPropertyDescriptor(
-                  window.HTMLInputElement.prototype, 'value').set;
-              setter.call(e, %s);
-              e.dispatchEvent(new Event('input', {bubbles: true}));
-              e.dispatchEvent(new Event('change', {bubbles: true}));
-              return true;
-            })()""" % (s, json.dumps("".join(digits))))
-            self._sleep(0.3, 0.6)
-            self._d(f"setter 后 value={self.page.value(sel)}")
+        # 2) 原生 setter + InputEvent + React onChange
+        try:
+            out = self.page.eval(self.JS_OTP_FILL % (s, json.dumps(target)))
+            self._d(f"React 注入: {out}")
+        except Exception as exc:  # noqa: BLE001
+            self._d(f"React 注入异常: {type(exc).__name__}: {exc}")
+        self._sleep(0.3, 0.6)
+        return sel
 
-        # 4) 补一轮键盘合成事件（部分实现监听 keydown）
-        self.page.eval("""(() => {
-          const e = document.querySelector(%s);
-          if (!e) return false;
-          e.focus();
-          for (const t of ['keydown', 'keypress', 'keyup']) {
-            e.dispatchEvent(new KeyboardEvent(t, {
-              key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-              bubbles: true, cancelable: true,
-            }));
-          }
-          return true;
-        })()""" % s)
-        return True
+    def _otp_progressed(self, before_url: str, before_state: dict) -> tuple[bool, dict]:
+        """判断页面是否已经往前走（离开注册页，或冒出新的按钮/报错）。"""
+        st = self.page.eval(JS_VISIBLE_STATE) or {}
+        url = str(st.get("url") or "")
+        if url and url != before_url and "/sign-up" not in url:
+            return True, st
+        old = {b.get("text") for b in (before_state.get("buttons") or [])}
+        new = {b.get("text") for b in (st.get("buttons") or [])}
+        if new - old:
+            return True, st
+        return False, st
+
+    def _dump_html(self, tag: str) -> str:
+        """把整页 HTML 存下来，事后能看见 React 到底渲染了什么。"""
+        try:
+            html = self.page.eval(
+                "document.body ? document.body.innerHTML.slice(0, 20000) : ''") or ""
+        except Exception:  # noqa: BLE001
+            html = ""
+        path = self.artifacts / f"cdp_{tag}_{int(time.time())}.html"
+        path.write_text(html, encoding="utf-8", errors="ignore")
+        self.report.artifacts.append(str(path))
+        return str(path)
 
     def step_otp(self, code_provider) -> bool:
         otp_wait = self.page.wait_js(
@@ -423,41 +461,98 @@ class QoderSignupCDP:
             return False
         self._stage("④ 收码", True, f"code={code}")
 
-        self.fill_otp(code)
-        state = self.page.eval(JS_VISIBLE_STATE) or {}
-        self._d(f"填码后 url={state.get('url')} buttons={state.get('buttons')}")
+        digits = "".join(c for c in code if c.isdigit())[:6]
+        before = self.page.eval(JS_VISIBLE_STATE) or {}
+        before_url = str(before.get("url") or self.page.url())
+        sel = self.fill_otp(code)
+        self._d(f"填码后 url={before_url} buttons={before.get('buttons')}")
 
-        # 尝试提交：先找按钮，再回车
-        clicked = self._click_submit()
-        if not clicked:
-            self.page.key(("Enter"))
-            clicked = "Enter"
-        self._d(f"提交方式: {clicked}")
-        self._sleep(3.0, 4.5)
+        ladder: list[str] = []
+        moved = False
+        state = before
 
-        state = self.page.eval(JS_VISIBLE_STATE) or {}
+        # ① 等自动提交（组件 onComplete 自己发请求）
+        for _ in range(2):
+            self._sleep(1.2, 1.8)
+            moved, state = self._otp_progressed(before_url, before)
+            if moved:
+                ladder.append("auto")
+                break
+
+        # ② 点可见按钮
+        if not moved:
+            clicked = self._click_submit()
+            if clicked:
+                ladder.append(f"click:{clicked}")
+                self._sleep(2.0, 3.0)
+                moved, state = self._otp_progressed(before_url, before)
+
+        # ③ 重新注入 + 回车（跑两轮，组件事后重渲染会吃掉第一次）
+        if not moved:
+            for i in range(2):
+                sel2 = self._otp_selector() or sel
+                if not sel2:
+                    break
+                try:
+                    self.page.eval(self.JS_OTP_FILL % (json.dumps(sel2),
+                                                       json.dumps(digits)))
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sleep(0.4, 0.8)
+                self.page.click(sel2, human=False)
+                self.page.key("Enter")
+                ladder.append(f"react+enter#{i + 1}")
+                self._sleep(2.0, 2.8)
+                moved, state = self._otp_progressed(before_url, before)
+                if moved:
+                    break
+
+        # ④ 表单级 submit
+        if not moved:
+            try:
+                self.page.eval("""(() => {
+                  const f = document.querySelector('form');
+                  if (!f) return false;
+                  if (f.requestSubmit) f.requestSubmit(); else f.submit();
+                  return true;
+                })()""")
+                ladder.append("form.submit")
+            except Exception:  # noqa: BLE001
+                pass
+            self._sleep(2.0, 3.0)
+            moved, state = self._otp_progressed(before_url, before)
+
         url = str(state.get("url") or self.page.url())
         body = str(state.get("body") or "")
-        self._d(f"提交后 url={url}")
+        self._d(f"提交阶梯={ladder} 结果 url={url} moved={moved}")
 
-        if "/sign-up" in url:
+        if not moved:
             dbg = self._dump("otp_stuck", JS_DEEP_DUMP)
             self.report.otp_debug = dbg
+            self._dump_html("otp_stuck")
             self._shot("otp_stuck")
             self._stage("④ 提交", False,
-                        f"停在本页，otpValue={state.get('otpValue')} "
+                        f"阶梯全部失效 {ladder}，otpValue={state.get('otpValue')} "
                         f"buttons={[b.get('text') for b in state.get('buttons') or []]}")
             return False
 
-        self._stage("④ 提交", True, f"已离开注册页 -> {url}")
+        self._sleep(1.5, 2.5)
+        state = self.page.eval(JS_VISIBLE_STATE) or state
+        url = str(state.get("url") or self.page.url())
+        body = str(state.get("body") or "")
+        if "/sign-up" in url:
+            self._dump_html("otp_partial")
+            self._stage("④ 提交", False, f"仍在注册页 url={url} 阶梯={ladder}")
+            return False
+
+        self._stage("④ 提交", True, f"已离开注册页 -> {url}（{ladder}）")
         low = body.lower()
         ok_markers = ("welcome", "dashboard", "get started", "workspace",
                       "sign out", "logout", "qoder ide")
         if any(m in low for m in ok_markers):
             self._stage("⑤ 登录态", True, "页面出现登录后标志")
         else:
-            self._stage("⑤ 登录态", True,
-                        f"url 已跳转（正文 {len(body)} 字）")
+            self._stage("⑤ 登录态", True, f"url 已跳转（正文 {len(body)} 字）")
         return True
 
     # ---------------------------------------------------------- 主流程

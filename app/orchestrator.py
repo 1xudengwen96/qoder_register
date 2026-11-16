@@ -67,8 +67,18 @@ class _DBHolder:
 class Pipeline:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
+        try:
+            from app import secrets
+
+            secrets.export_env()
+        except Exception:  # noqa: BLE001
+            pass
         self.mail_layer = build_mail_layer(cfg, _DBHolder)
         self.proxies = ProxyPool.from_file(get(cfg, "proxy.file", "data/proxies.txt"))
+        from app.net.proxy import ProxyLedger
+
+        self.ledger = ProxyLedger(get(cfg, "proxy.state_file",
+                                      "data/.proxy_state.json"))
         self.solver = build_solver(cfg)
         self.engine = build_fingerprint_engine(cfg)
         self.registrar = BrowserRegistrar(
@@ -80,6 +90,31 @@ class Pipeline:
             hcaptcha_site_key=get(cfg, "register.hcaptcha_site_key", None),
             turnstile_site_key=get(cfg, "register.turnstile_site_key", None),
         )
+        # 注册通道：CDP（比特浏览器自动填代理）优先，Playwright 引擎兜底
+        backend = str(get(cfg, "browser.backend", "") or "").lower()
+        self.cdp_registrar = None
+        self.use_cdp = bool(get(cfg, "browser.cdp_mode", backend == "bitbrowser"))
+        if self.use_cdp:
+            from app.register.cdp_registrar import CDPRegistrar
+
+            self.cdp_registrar = CDPRegistrar(
+                cfg,
+                api_base=get(cfg, "browser.bitbrowser.api_base",
+                             "http://127.0.0.1:54345"),
+                group_id=(get(cfg, "browser.bitbrowser.group_id", "") or None),
+                env_id=get(cfg, "browser.bitbrowser.env_id", "") or "",
+                reuse_env=bool(get(cfg, "browser.bitbrowser.reuse_env", True)),
+                signup_url=get(cfg, "register.cdp_signup_url",
+                               "https://qoder.com/users/sign-up"),
+                artifacts_dir=get(cfg, "storage.artifacts_dir", "data/artifacts"),
+                captcha_max_attempts=int(get(cfg, "captcha.max_attempts", 6)),
+                otp_timeout=int(get(cfg, "verify.timeout", 240)),
+                imap_proxy=(get(cfg, "mail.imap_proxy", "") or None),
+                headless=bool(get(cfg, "browser.bitbrowser.headless", False)),
+                keep_open=bool(get(cfg, "browser.bitbrowser.keep_open", False)),
+                logger=log,
+            )
+
         self.verifier = Verifier(
             mail_layer=self.mail_layer,
             timeout=int(get(cfg, "verify.timeout", 600)),
@@ -134,6 +169,83 @@ class Pipeline:
                 if status == MailStatus.USED:
                     row.used_at = datetime.now()
 
+    # ------------------------------------------------------------ 代理分配
+    def _acquire_proxy(self, region: str | None = None, env_tag: str = "") -> object | None:
+        """给这次开窗口取**一条没用过**的代理；池子空了就按模板续期。
+
+        ipdeep 这类按 session 计费的代理商：一条会话 = 一个出口 IP，粘性 5 分钟。
+        所以每条只能用一次，用完留在账本里作废，下一轮换新的。
+        """
+        from app.net.proxy import acquire_once
+
+        if not bool(get(self.cfg, "proxy.one_shot", True)):
+            return self.proxies.acquire(region=region)
+
+        check = bool(get(self.cfg, "proxy.check_before_use", True))
+        timeout = int(get(self.cfg, "proxy.check_timeout", 12))
+        px = acquire_once(self.proxies, self.ledger, region=region,
+                          check=check, timeout=timeout)
+        if px is None and bool(get(self.cfg, "proxy.auto_extend", True)):
+            added = self._extend_proxies(region=region)
+            if added:
+                self.proxies = ProxyPool.from_file(
+                    get(self.cfg, "proxy.file", "data/proxies.txt"))
+                px = acquire_once(self.proxies, self.ledger, region=region,
+                                  check=check, timeout=timeout)
+        if px is not None and env_tag:
+            self.ledger.mark(px, env=env_tag, note="in-use")
+        return px
+
+    def _extend_proxies(self, region: str | None = None) -> int:
+        """按 proxy.extend.template 生成新会话并写回代理文件。"""
+        from app.net.proxy import append_to_file, extend_from_template
+
+        tpl = str(get(self.cfg, "proxy.extend.template", "") or "")
+        if not tpl:
+            return 0
+        region = (region or get(self.cfg, "region", "us")).lower()
+        user_tpl = str(get(self.cfg, "proxy.extend.user", "") or "")
+        raws = extend_from_template(
+            template=tpl,
+            user=user_tpl.replace("{region}", region),
+            password=str(get(self.cfg, "proxy.extend.password", "") or ""),
+            ttl=int(get(self.cfg, "proxy.extend.ttl", 5)),
+            count=int(get(self.cfg, "proxy.extend.count", 20)),
+            region=region,
+            verify=bool(get(self.cfg, "proxy.extend.verify", True)),
+        )
+        added = append_to_file(get(self.cfg, "proxy.file", "data/proxies.txt"), raws)
+        log.info("代理续期：模板生成 %d 条，存活并写入 %d 条", len(raws), added)
+        return added
+
+    # ------------------------------------------------------------ 注册通道
+    def _do_register(self, email_addr: str, password: str, username: str,
+                     proxy, region: str, account_tag: str, ident):
+        """按配置选注册通道：CDP（比特浏览器 + 自动填代理）或 Playwright 引擎。"""
+        if self.cdp_registrar is None:
+            return self.registrar.register(
+                email_addr, password, username,
+                proxy=proxy, region=region, account_tag=account_tag,
+            )
+
+        from app.register.otp_source import make_code_source
+
+        src = make_code_source(
+            self.cfg, email=email_addr, ident=ident,
+            mail_layer=self.mail_layer,
+            timeout=int(get(self.cfg, "verify.timeout", 240)),
+            imap_proxy=(get(self.cfg, "mail.imap_proxy", "") or None),
+        )
+        try:
+            return self.cdp_registrar.register(
+                email_addr, password,
+                proxy=proxy, region=region, account_tag=account_tag,
+                code_source=src,
+            )
+        finally:
+            if src is not None:
+                src.close()
+
     # ------------------------------------------------------------ 分段执行
     def register_only(self, region: str | None = None, worker: int = 0) -> RunReport:
         """只做注册 + 验证，不碰设备、不碰客户端。可并发跑多个 worker。
@@ -165,7 +277,7 @@ class Pipeline:
         self._event(account_id, "mail", "info", f"取到邮箱 {email_addr}",
                     {"provider": ident.provider, "worker": worker}, mail_id)
 
-        proxy = self.proxies.acquire(region=region)
+        proxy = self._acquire_proxy(region=region, env_tag=f"acct{account_id}")
         if proxy is None:
             self._fail(account_id, "proxy", "代理池无可用出口")
             return RunReport(False, account_id, email_addr, "proxy", "代理池无可用出口")
@@ -177,10 +289,8 @@ class Pipeline:
             imap_host=getattr(ident, "imap_host", None),
             meta=getattr(ident, "meta", {}) or {},
         )
-        reg = self.registrar.register(
-            email_addr, password, username,
-            proxy=proxy, region=region,
-            account_tag=f"acct{account_id}",
+        reg = self._do_register(
+            email_addr, password, username, proxy, region, f"acct{account_id}", ident,
         )
         if not reg.ok:
             if reg.kind == "email_conflict" and ident.provider == "outlook_tag":
@@ -197,13 +307,15 @@ class Pipeline:
             a.state = AccountState.REGISTERED
             a.register_ip = proxy.exit_ip_hint
 
-        vres = self.verifier.run(mident, proxy=proxy)
-        if not vres.ok:
-            self._mail_status(ident, MailStatus.DROPPED)
-            self._flag(account_id, "mail_dropped")
-            self._fail(account_id, "verify", vres.error)
-            return RunReport(False, account_id, email_addr, "verify", vres.error,
-                             captcha_provider=reg.used_captcha)
+        # CDP 通道在注册内部就完成了邮箱验证（6 位码），不再等确认链接
+        if self.cdp_registrar is None:
+            vres = self.verifier.run(mident, proxy=proxy)
+            if not vres.ok:
+                self._mail_status(ident, MailStatus.DROPPED)
+                self._flag(account_id, "mail_dropped")
+                self._fail(account_id, "verify", vres.error)
+                return RunReport(False, account_id, email_addr, "verify", vres.error,
+                                 captcha_provider=reg.used_captcha)
 
         with session_scope() as s:
             s.get(Account, account_id).state = AccountState.VERIFIED
@@ -287,6 +399,24 @@ class Pipeline:
 
     # ------------------------------------------------------------ 单轮（串行全流程）
     def run_one(self, region: str | None = None, dry_run_device: bool = False) -> RunReport:
+        """跑一轮完整循环；无论成败，收尾都把账号/token 落成 txt。"""
+        try:
+            return self._run_one(region=region, dry_run_device=dry_run_device)
+        finally:
+            self._export_outputs()
+
+    def _export_outputs(self) -> None:
+        try:
+            from app.stock.txt_export import export_all
+
+            with session_scope() as s:
+                rep = export_all(s, get(self.cfg, "storage.output_dir", "data/output"))
+            log.info("输出已刷新：账号 %d 条 / token %d 条 -> %s",
+                     rep.accounts, rep.tokens, rep.files.get("accounts", ""))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("文本导出失败（不影响流程）：%s: %s", type(exc).__name__, exc)
+
+    def _run_one(self, region: str | None = None, dry_run_device: bool = False) -> RunReport:
         region = (region or get(self.cfg, "region", "us")).lower()
         tz = get(self.cfg, f"region_profiles.{region}.timezone", "America/New_York")
 
@@ -314,7 +444,7 @@ class Pipeline:
                     {"provider": ident.provider}, mail_id)
 
         # 代理
-        proxy = self.proxies.acquire(region=region)
+        proxy = self._acquire_proxy(region=region, env_tag=f"acct{account_id}")
         if proxy is None:
             self._fail(account_id, "proxy", "代理池无可用出口")
             return RunReport(False, account_id, email_addr, "proxy", "代理池无可用出口")
@@ -327,10 +457,8 @@ class Pipeline:
             imap_host=getattr(ident, "imap_host", None),
             meta=getattr(ident, "meta", {}) or {},
         )
-        reg = self.registrar.register(
-            email_addr, password, username,
-            proxy=proxy, region=region,
-            account_tag=f"acct{account_id}",
+        reg = self._do_register(
+            email_addr, password, username, proxy, region, f"acct{account_id}", ident,
         )
         if not reg.ok:
             if reg.kind == "email_conflict" and ident.provider == "outlook_tag":
@@ -354,17 +482,21 @@ class Pipeline:
                     {"screenshot": reg.screenshot, "url": reg.page_url})
 
         # ④ 验证
-        vres = self.verifier.run(mident, proxy=proxy)
-        if not vres.ok:
-            self._mail_status(ident, MailStatus.DROPPED)
-            self._flag(account_id, "mail_dropped")
-            self._fail(account_id, "verify", vres.error)
-            return RunReport(False, account_id, email_addr, "verify", vres.error,
-                             captcha_provider=reg.used_captcha)
+        if self.cdp_registrar is None:
+            vres = self.verifier.run(mident, proxy=proxy)
+            if not vres.ok:
+                self._mail_status(ident, MailStatus.DROPPED)
+                self._flag(account_id, "mail_dropped")
+                self._fail(account_id, "verify", vres.error)
+                return RunReport(False, account_id, email_addr, "verify", vres.error,
+                                 captcha_provider=reg.used_captcha)
+            verify_detail = {"link": vres.link}
+        else:
+            verify_detail = {"mode": "otp-in-signup"}
 
         with session_scope() as s:
             s.get(Account, account_id).state = AccountState.VERIFIED
-        self._event(account_id, "verify", "info", "邮箱验证通过", {"link": vres.link})
+        self._event(account_id, "verify", "info", "邮箱验证通过", verify_detail)
 
         # ⑤ 设备重置（qoder-free 改造版，全量 9 步）
         rres = self.resetter.run(ResetOptions(

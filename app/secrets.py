@@ -28,6 +28,7 @@ ENV_MAP = {
     "captcha.twocaptcha_key": "TWOCAPTCHA_KEY",
     "ipdeep.key": "IPDEEP_KEY",
     "ipdeep.secret": "IPDEEP_SECRET",
+    "ipdeep.pass": "IPDEEP_PASS",
     "mail.outlook_file": "QODER_MAIL_FILE",
     "bitbrowser.env_id": "BITBROWSER_ENV_ID",
 }

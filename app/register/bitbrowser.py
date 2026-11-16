@@ -246,36 +246,63 @@ def build_fingerprint(
 
 
 def build_proxy_config(
-    proxy_raw: str | None,
+    proxy=None,
     proxy_type: str = "http",
 ) -> dict:
-    """把 ``http://user:pass@host:port`` 转成比特浏览器的代理字段。
+    """把代理转成比特浏览器的代理字段。
+
+    支持三种入参：
+    - ``None``                       → 直连（``proxyMethod=3``）
+    - ``app.net.proxy.Proxy`` 对象   → 直接取字段
+    - ``str``                        → ``host:port:user:pass`` / ``user:pass@host:port`` /
+                                       ``http://user:pass@host:port`` 都认（走 parse_line）
 
     返回可直接 ``**`` 展开进 ``/browser/update`` 请求体的 dict。
-    直连时用 ``proxyMethod=3, proxyType=noproxy``。
     """
-    if not proxy_raw:
+    if not proxy:
         return {"proxyMethod": 3, "proxyType": "noproxy"}
 
-    raw = proxy_raw if "://" in proxy_raw else "http://" + proxy_raw
-    u = urllib.parse.urlparse(raw)
-    scheme = u.scheme.lower()
-    if scheme.startswith("socks5"):
-        ptype = "socks5"
-    elif scheme.startswith("https"):
-        ptype = "https"
-    else:
-        ptype = "http"
+    if isinstance(proxy, dict):
+        if proxy.get("proxyMethod"):
+            return dict(proxy)
+        raw = proxy.get("raw") or proxy.get("url")
+        if raw:
+            return build_proxy_config(raw, proxy_type)
+        host = str(proxy.get("host") or "")
+        port = str(proxy.get("port") or "")
+        if not host or not port:
+            return {"proxyMethod": 3, "proxyType": "noproxy"}
+        ptype = str(proxy.get("proxyType") or proxy.get("scheme") or proxy_type or "http")
+        return {
+            "proxyMethod": 2,
+            "proxyType": ptype,
+            "host": host,
+            "port": port,
+            "proxyUserName": str(proxy.get("proxyUserName") or proxy.get("username") or ""),
+            "proxyPassword": str(proxy.get("proxyPassword") or proxy.get("password") or ""),
+            "enableSocks5Udp": ptype.startswith("socks5"),
+        }
 
-    return {
-        "proxyMethod": 2,             # 2 = 自定义代理
-        "proxyType": ptype,
-        "host": u.hostname or "",
-        "port": str(u.port or ""),
-        "proxyUserName": urllib.parse.unquote(u.username or ""),
-        "proxyPassword": urllib.parse.unquote(u.password or ""),
-        "enableSocks5Udp": ptype == "socks5",
-    }
+    if hasattr(proxy, "host") and hasattr(proxy, "port"):
+        scheme = (getattr(proxy, "scheme", "") or proxy_type or "http").lower()
+        ptype = "socks5" if scheme.startswith("socks5") else (
+            "https" if scheme.startswith("https") else "http")
+        return {
+            "proxyMethod": 2,             # 2 = 自定义代理
+            "proxyType": ptype,
+            "host": str(proxy.host),
+            "port": str(proxy.port),
+            "proxyUserName": str(getattr(proxy, "username", "") or ""),
+            "proxyPassword": str(getattr(proxy, "password", "") or ""),
+            "enableSocks5Udp": ptype == "socks5",
+        }
+
+    from app.net.proxy import parse_line
+
+    px = parse_line(str(proxy))
+    if px is None:
+        raise ValueError(f"无法解析代理：{proxy}")
+    return build_proxy_config(px, proxy_type)
 
 
 # ============================================================ 客户端
@@ -433,6 +460,16 @@ class BitBrowserClient:
         body.update(fields)
         d = self.call("/browser/update", body, timeout=90).get("data") or {}
         return BitBrowserEnv.from_api(d)
+
+    def apply_proxy(self, env_id: str, proxy) -> BitBrowserEnv:
+        """把代理写进已存在的环境（注册前自动填代理的入口）。
+
+        实测 ``/browser/update`` 必须带 ``browserFingerPrint`` 和 ``proxyMethod``，
+        这里统一从详情继承指纹，只覆盖代理那几个字段。
+        """
+        cfg = build_proxy_config(proxy)
+        fields = {k: v for k, v in cfg.items() if k in PROXY_FIELDS}
+        return self.update_env(env_id, **fields)
 
     def delete_env(self, env_id: str) -> bool:
         try:

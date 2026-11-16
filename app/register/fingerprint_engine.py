@@ -503,7 +503,7 @@ class BitBrowserEngine(FingerprintEngine):
         return None
 
     def _ensure_env(self, name: str, profile: FingerprintProfile, proxy) -> str:
-        from app.register.bitbrowser import build_fingerprint
+        from app.register.bitbrowser import build_fingerprint, build_proxy_config
 
         existing = self._find_env(name)
         if existing:
@@ -521,6 +521,8 @@ class BitBrowserEngine(FingerprintEngine):
                         device_memory=profile.device_memory,
                         fonts=profile.fonts,
                     ),
+                    # 复用环境也必须重写代理，否则还是上一轮的出口 IP
+                    **build_proxy_config(proxy),
                 )
                 return existing
             except Exception:

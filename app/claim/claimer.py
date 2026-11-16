@@ -80,8 +80,15 @@ class Claimer:
         login_mode: str = "inherit",
         relogin_timeout: int = 120,
     ) -> None:
-        self.client_path = client_path or str(
-            (qoder_install_dir() or Path("")) / "Qoder.exe")
+        if client_path:
+            self.client_path = str(client_path)
+            self.client_source = "config"
+        else:
+            from app.claim.client_path import find_client
+
+            picked, chosen, _cands = find_client()
+            self.client_path = str(picked) if picked else ""
+            self.client_source = chosen.source if chosen else "not-found"
         self.data_dir = Path(account_data_dir) if account_data_dir else qoder_data_dir()
         self.timeout = wait_credit_timeout
         self.capture_token = capture_token
@@ -145,12 +152,17 @@ class Claimer:
         if not exe.exists():
             return False
         args = [str(exe)]
-        if remote_debug and self.debug_port:
-            args.append(f"--remote-debugging-port={self.debug_port}")
+        if remote_debug:
+            port = self.debug_port or 9222
+            args.append(f"--remote-debugging-port={port}")
         try:
+            from app.claim.client_path import clean_env
+
+            # 必须剔除 ELECTRON_RUN_AS_NODE：否则 Electron 会以 node 身份跑，
+            # 无参数时读 stdin 到 EOF 直接退 0，看起来像"启动后立刻退出"。
             self._proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=str(exe.parent),
+                cwd=str(exe.parent), env=clean_env(),
             )
             return True
         except Exception:

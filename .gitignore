@@ -30,6 +30,20 @@ data/*
 .DS_Store
 Thumbs.db
 
-# 本机密钥与运行参数
+# ????????????в???
 config/secrets.yaml
 
+
+.tools/
+.ms-playwright/
+
+
+# 本机运行脚本 / 代理清单（含账号密码，绝不进仓库）
+env.ps1
+proxies-*.txt
+data/*.csv
+data/*.txt
+
+# 代理清单备份（含账号密码）
+proxies-*.txt*
+*.bak

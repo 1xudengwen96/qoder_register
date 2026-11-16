@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.config import get, to_plain
 from app.mail.aggregator import MailAggregator
 from app.mail.base import MailProvider
@@ -24,6 +26,24 @@ def taken_addresses(db) -> set[str]:
 def build_mail_layer(cfg, db) -> MailAggregator:
     taken = taken_addresses(db)
     providers: dict[str, MailProvider] = {}
+
+    # 路线 D：手工维护的 Outlook 清单（data/emails.txt），优先级最高
+    of_cfg = get(cfg, "mail.outlook_file", "") or ""
+    if not of_cfg:
+        try:
+            from app import secrets
+
+            of_cfg = secrets.get("mail.outlook_file", "") or ""
+        except Exception:  # noqa: BLE001
+            of_cfg = ""
+    if of_cfg and Path(of_cfg).exists():
+        from app.mail.outlook_file import OutlookFileProvider
+
+        providers["outlook_file"] = OutlookFileProvider(
+            of_cfg,
+            taken_addresses=taken,
+            imap_proxy=(get(cfg, "mail.imap_proxy", "") or None),
+        )
 
     ot_cfg = get(cfg, "mail.outlook_tag")
     if ot_cfg and get(ot_cfg, "main_accounts"):

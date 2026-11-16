@@ -68,19 +68,11 @@ def qoder_data_dir() -> Path:
 
 
 def qoder_install_dir() -> Path | None:
-    """Qoder 安装目录（找 Qoder.exe）。"""
-    if os.name != "nt":
-        return None
-    cands = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Qoder",
-        Path("C:/Program Files/Qoder"),
-        Path("C:/Program Files (x86)/Qoder"),
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Qoder",
-    ]
-    for c in cands:
-        if (c / "Qoder.exe").exists():
-            return c
-    return None
+    """Qoder 安装目录（交给 client_path 自动探测，不写死路径）。"""
+    from app.claim.client_path import find_client
+
+    path, _chosen, _cands = find_client()
+    return path.parent if path else None
 
 
 # ============================================================ 数据类

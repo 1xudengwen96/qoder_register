@@ -1,4 +1,4 @@
-﻿"""CLI 入口：python -m app.cli <command>"""
+"""CLI 入口：python -m app.cli <command>"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from app.config import get, load_config
@@ -345,6 +346,408 @@ def cmd_stats(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 邮箱清单体检
+def cmd_mail_file(args) -> int:
+    """体检/入库 data/emails.txt（email----pass----clientId----refreshToken）。"""
+    cfg = load_config(args.config)
+    init_engine(get(cfg, "storage.url", "sqlite:///data/qoder.db"))
+    create_all()
+
+    from app.mail.outlook_file import audit
+
+    path = args.file or get(cfg, "mail.outlook_file", "data/emails.txt")
+    rep = audit(path)
+    print("=== 清单体检 ===")
+    for line in rep.lines():
+        print(f"- {line}")
+
+    if rep.bad_lines:
+        print("\n格式错误行（应为 4 段或 6 段，用 ---- 分隔）：")
+        lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        for n in rep.bad_lines[:10]:
+            print(f"  第 {n} 行: {lines[n - 1][:80]}")
+
+    if rep.addresses:
+        print(f"\n前 5 条：")
+        for a in rep.addresses[:5]:
+            print(f"  {a}")
+        if len(rep.addresses) > 5:
+            print(f"  ... 还有 {len(rep.addresses) - 5} 条")
+
+    if args.verify:
+        from app.mail.outlook_oauth import OutlookMailbox, load_accounts
+
+        print("\n=== 令牌实测（刷 OAuth + 连 IMAP）===")
+        accs = load_accounts(path)
+        ok_n = 0
+        for i, acc in enumerate(accs, 1):
+            box = OutlookMailbox(acc)
+            try:
+                box.refresh_access_token()
+                box.connect()
+                box.select("INBOX")
+                n = len(box.list_uids())
+                print(f"{i:2d}. {acc.email:38s} OK   INBOX {n} 封")
+                ok_n += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"{i:2d}. {acc.email:38s} FAIL {type(exc).__name__}: "
+                      f"{str(exc)[:70]}")
+            finally:
+                try:
+                    box.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(0.3)
+        print(f"\n令牌可用 {ok_n}/{len(accs)}")
+        if ok_n < len(accs):
+            return 2
+
+    if not args.import_to_db:
+        print("\n（加 --import 把地址写进数据库邮箱池）")
+        return 0 if rep.total else 2
+    with session_scope() as s:
+        added = skipped = 0
+        for addr in rep.addresses:
+            low = addr.lower()
+            if s.query(MailRow).filter(MailRow.address == low).first():
+                skipped += 1
+                continue
+            s.add(MailRow(
+                provider=MailProviderEnum.OUTLOOK_FILE,
+                address=addr,
+                parent_account=None,
+                status=MailStatus.POOL,
+                note=f"source={path}",
+            ))
+            added += 1
+    print(f"\n入库 {added} 条，跳过 {skipped} 条（已存在）")
+    return 0
+
+
+# ---------------------------------------------------------------- 代理续期
+def cmd_proxy_gen(args) -> int:
+    """按模板批量生成新会话代理（ipdeep 这类按 session 计费的入口）。"""
+    cfg = load_config(args.config)
+    from app.net.proxy import ProxyPool, append_to_file, extend_from_template
+
+    tpl = args.template or get(cfg, "proxy.extend.template", "")
+    if not tpl:
+        print("没有模板：配置 proxy.extend.template 或传 --template")
+        return 2
+    region = (args.region or get(cfg, "region", "us")).lower()
+    user = (args.user or get(cfg, "proxy.extend.user", "")).replace("{region}", region)
+    password = args.password or str(get(cfg, "proxy.extend.password", "") or "")
+    ttl = int(args.ttl or get(cfg, "proxy.extend.ttl", 5))
+    count = int(args.count or get(cfg, "proxy.extend.count", 20))
+
+    print(f"模板: {tpl}")
+    print(f"账号: {user}  地区={region} 粘性={ttl}分钟 目标={count}条 验证={'否' if args.no_verify else '是'}")
+    raws = extend_from_template(
+        template=tpl, user=user, password=password, ttl=ttl, count=count,
+        region=region, verify=not args.no_verify,
+        concurrency=args.workers, timeout=args.timeout,
+    )
+    print(f"生成并存活: {len(raws)} 条")
+    path = args.file or get(cfg, "proxy.file", "data/proxies.txt")
+    if args.replace:
+        target = Path(path)
+        if target.exists():
+            target.rename(target.with_suffix(target.suffix + ".bak"))
+        target.write_text(chr(10).join(raws) + chr(10), encoding="utf-8")
+        print(f"已覆盖写入 {path}（旧文件存为 .bak）")
+    else:
+        added = append_to_file(path, raws)
+        print(f"追加写入 {path}：新增 {added} 条")
+    pool = ProxyPool.from_file(path)
+    print(f"代理池: {pool.summary()}")
+    return 0 if raws else 2
+
+
+def cmd_proxy_state(args) -> int:
+    """看一条一用账本：文件里多少条、用了多少、还剩多少。"""
+    cfg = load_config(args.config)
+    from app.net.proxy import ProxyLedger, ProxyPool
+
+    ledger = ProxyLedger(get(cfg, "proxy.state_file", "data/.proxy_state.json"))
+    pool = ProxyPool.from_file(get(cfg, "proxy.file", "data/proxies.txt"))
+    if args.prune:
+        n = ledger.prune(keep_hours=args.keep_hours)
+        print(f"清理 {n} 条过期账目（保留 {args.keep_hours} 小时）")
+    st = ledger.stats()
+    raws = [p.raw for p in pool.proxies]
+    remain = ledger.remaining(raws)
+    print("=== 代理账本 ===")
+    print(f"- 文件      : {get(cfg, 'proxy.file', '')}")
+    print(f"- 文件条数  : {len(raws)}")
+    print(f"- 已消耗    : {st['total']}")
+    print(f"- 本文件剩余: {remain}")
+    if st["by_note"]:
+        detail = " ".join(f"{k}:{v}" for k, v in sorted(st["by_note"].items()))
+        print(f"- 消耗明细  : {detail}")
+    entries = ledger._read()["entries"]
+    recent = sorted(entries.items(), key=lambda kv: float(kv[1].get("used_at") or 0),
+                    reverse=True)[:5]
+    if recent:
+        print("\n最近 5 条:")
+        for raw, meta in recent:
+            print(f"  {meta.get('label', raw)[:44]:46s} env={meta.get('env','-'):8s} {meta.get('note','')}")
+    return 0 if remain else 3
+
+
+# ---------------------------------------------------------------- 单号领取
+def cmd_claim_one(args) -> int:
+    """单账号领取：登录（可选自动）→ 抓 token → 核对额度 → 入库 → 落 txt。"""
+    cfg = load_config(args.config)
+    init_engine(get(cfg, "storage.url", "sqlite:///data/qoder.db"))
+    create_all()
+    from app.claim.claimer import Claimer
+    from app.stock.txt_export import export_all
+
+    email = args.email
+    password = args.password
+    if not email:
+        with session_scope() as s:
+            row = (s.query(Account)
+                   .filter(Account.state.in_([AccountState.VERIFIED, AccountState.REGISTERED]))
+                   .order_by(Account.id.asc()).first())
+            if row:
+                email, password = row.email, row.password or ""
+    if not email:
+        print("没有可领取的账号：用 --email/--password 指定，或先跑注册")
+        return 2
+    print(f"=== 领取 {email} ===")
+
+    claimer = Claimer(
+        client_path=get(cfg, "claim.client_path", ""),
+        login_mode="cdp" if args.login else "inherit",
+        wait_credit_timeout=int(get(cfg, "claim.wait_credit_timeout", 120)),
+        capture_token=True,
+        credit_probe_url=get(cfg, "claim.credit_probe_url", None) or None,
+    )
+    print(f"客户端: {claimer.client_path}")
+
+    ui = None
+    login_state: dict = {}
+    if args.login:
+        from app.claim import ui_login
+        from app.net.proxy import ProxyLedger, ProxyPool, acquire_once
+
+        def _ui_login(_claimer) -> bool:
+            print("请在弹出的 Qoder 客户端窗口点一次「登录」（或点「复制登录链接」）…")
+            print(f"我在等登录链接，最多 {args.link_timeout}s（剪贴板 / 浏览器历史都会看）")
+            started = time.time()
+            link, src = ui_login.wait_link(timeout=args.link_timeout, since=started)
+            if not link:
+                print("没等到登录链接")
+                return False
+            print(f"拿到链接（来源={src}）: {link[:100]}…")
+            pool = ProxyPool.from_file(get(cfg, "proxy.file", "data/proxies.txt"))
+            ledger = ProxyLedger(get(cfg, "proxy.state_file", "data/.proxy_state.json"))
+            px = acquire_once(pool, ledger, region=get(cfg, "region", "us"))
+            out = ui_login.drive_login(
+                cfg, link, email, password,
+                env_name=f"login_{args.env_name or 'one'}",
+                region=get(cfg, "region", "us"),
+                timeout=args.login_timeout, proxy=px,
+                artifacts_dir=get(cfg, "storage.artifacts_dir", "data/artifacts"),
+            )
+            print(f"浏览器登录结果: {out.as_dict()}")
+            if not out.ok:
+                return False
+            ledger.mark(px, env=out.env_id, note="login")
+            login_state["credits"] = out.credits
+            login_state["plan"] = out.plan
+            login_state["detail"] = out.credits_detail
+            if out.deep_link:
+                return ui_login.dispatch_deep_link(out.deep_link)
+            return True
+
+        ui = _ui_login
+
+    res = claimer.perform(email, password, ui_login=ui)
+
+    # 登录会话里已经读到额度就直接用；否则再开窗口读一次
+    if res.credits <= 0 and login_state.get("credits"):
+        res.credits = int(login_state["credits"])
+        res.plan = login_state.get("plan") or res.plan
+        print(f"登录会话额度: {login_state.get('detail')} 计划={res.plan}")
+    elif res.credits <= 0:
+        from app.claim.credit_page import read_credits
+
+        cred = read_credits(cfg, env_name=f"login_{args.env_name or 'one'}",
+                            region=get(cfg, "region", "us"))
+        if cred.total or cred.left:
+            res.credits = cred.credits
+            print(f"账号页额度: {cred.as_dict()} 计划={cred.plan}")
+        else:
+            print(f"账号页额度: {cred.as_dict()} 计划={cred.plan}"
+                  f"（还没在客户端领取？）")
+        res.plan = res.plan if (res.plan and res.plan != "pro_trial") else (cred.plan or res.plan)
+
+    print(json.dumps({
+        "ok": res.ok, "credits": res.credits, "plan": res.plan,
+        "token_source": res.token_source, "error": res.error,
+        "expire_at": res.expire_at.isoformat(sep=" ", timespec="seconds") if res.expire_at else "",
+    }, ensure_ascii=False, indent=1))
+
+    with session_scope() as s:
+        acc = s.query(Account).filter(Account.email == email).first()
+        if acc is None:
+            acc = Account(email=email, password=password, username="", state=AccountState.NEW)
+            s.add(acc)
+            s.flush()
+        if res.token:
+            acc.token_json = json.dumps(res.token, ensure_ascii=False)
+        if res.ok and res.credits > 0:
+            acc.state = AccountState.STOCK
+            acc.credits = res.credits
+            acc.plan = res.plan or acc.plan
+            acc.trial_expire_at = res.expire_at
+            acc.claimed_at = datetime.now()
+        elif res.ok:
+            acc.state = AccountState.CLAIMED if acc.state != AccountState.STOCK else acc.state
+        rep = export_all(s, get(cfg, "storage.output_dir", "data/output"))
+
+    print(f"账号已更新（状态 {acc.state.value}），输出: {rep.files.get('accounts')}")
+    return 0 if res.ok else 2
+
+
+# ---------------------------------------------------------------- 文本导出
+def cmd_export_txt(args) -> int:
+    """把账号 / token / 统计各写一个 txt（全量重写）。"""
+    cfg = load_config(args.config)
+    init_engine(get(cfg, "storage.url", "sqlite:///data/qoder.db"))
+    create_all()
+    from app.stock.txt_export import export_all
+
+    out_dir = args.dir or get(cfg, "storage.output_dir", "data/output")
+    with session_scope() as s:
+        rep = export_all(s, out_dir)
+    print("=== 文本导出 ===")
+    for name, path in rep.files.items():
+        size = Path(path).stat().st_size if Path(path).exists() else 0
+        print(f"- {name:9s} {path}  ({size} bytes)")
+    print(f"- 账号 {rep.accounts} 条，含 token {rep.tokens} 条")
+    return 0
+
+
+# ---------------------------------------------------------------- 客户端路径探测
+def cmd_client_find(args) -> int:
+    """列出所有候选并给出选中项（不写死任何机器路径）。"""
+    cfg = load_config(args.config)
+    from app.claim.client_path import describe, find_client
+
+    override = args.path or (get(cfg, "claim.client_path", "") or "")
+    print(describe(override=override))
+    path, chosen, _cands = find_client(override=override)
+    if path is None:
+        print("\n没找到客户端：确认 Qoder 客户端已安装，或用 --path / claim.client_path 指定")
+        return 2
+    print(f"\n结论：用 {path}")
+    if chosen and "launcher" in chosen.path.name.lower():
+        print("      这是启动器入口，会自己拉起 .qoder-versions 里的本体")
+    return 0
+
+
+# ---------------------------------------------------------------- 比特代理联调
+def cmd_browser_probe(args) -> int:
+    """把本地代理文件里的代理写进比特浏览器环境，可选直接启动校验 CDP。"""
+    cfg = load_config(args.config)
+    from app.register import bb_cdp
+    from app.register.bitbrowser import BitBrowserClient
+    from app.net.proxy import ProxyPool
+
+    pool = ProxyPool.from_file(get(cfg, "proxy.file", "proxies-cn-sticky.txt"))
+    if args.proxy:
+        from app.net.proxy import parse_line
+
+        one = parse_line(args.proxy)
+        if one is None:
+            print(f"--proxy 解析失败：{args.proxy}")
+            return 2
+        pool = ProxyPool([one])
+    print(f"=== 代理池 ===\n- {pool.summary()}")
+    if not pool.proxies:
+        print("代理池为空，检查 proxy.file")
+        return 2
+
+    if args.check_all:
+        import concurrent.futures as cf
+
+        def _probe(px):
+            return px, pool.check(px, timeout=args.timeout)
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+            rows = list(ex.map(_probe, pool.proxies))
+        alive = sum(1 for _, ok in rows if ok)
+        for px, ok in rows:
+            print(f"  {'OK  ' if ok else 'DEAD'} {px.label}")
+        print(f"\n- 存活 {alive}/{len(rows)}")
+        return 0 if alive else 2
+    from app.net.proxy import ProxyLedger, acquire_once
+
+    ledger = ProxyLedger(get(cfg, "proxy.state_file", "data/.proxy_state.json"))
+    if args.reuse:
+        idx = args.proxy_index % len(pool.proxies)
+        px = pool.proxies[idx]
+        print(f"- 复用 #{idx} {px.label}（不消耗账本）")
+    else:
+        px = acquire_once(pool, ledger, region=(args.region or get(cfg, "region", "us")),
+                          check=False)
+        if px is None:
+            print("- 代理池里没有未使用过的了，跑 proxy:gen 续期")
+            return 2
+        print(f"- 取用一条新代理 {px.label}")
+        print(f"- 剩余未用: {ledger.remaining([p.raw for p in pool.proxies])}")
+    print(f"- 归一化: {px.raw}")
+    if px.session:
+        print(f"- 粘性会话: {px.session}"
+              f"{f'（{px.sticky_minutes} 分钟）' if px.sticky_minutes else ''}")
+
+    api_base = get(cfg, "browser.bitbrowser.api_base", "http://127.0.0.1:54345")
+    client = BitBrowserClient(api_base)
+    ok, detail = (client.health(), "OK") if client.is_port_open() else (False, "端口未监听")
+    print(f"\n=== 比特浏览器 ===\n- {api_base} {'OK' if ok else detail}")
+    if not ok:
+        return 2
+
+    region = (args.region or get(cfg, "region", "us")).lower()
+    env_name = args.env_name or f"qoder_probe_{idx}"
+    group_id = get(cfg, "browser.bitbrowser.group_id", "") or None
+    fields = ("proxyMethod", "proxyType", "host", "port",
+              "proxyUserName", "proxyPassword")
+
+    if not args.launch:
+        env_id, created = bb_cdp.ensure_env(
+            client, name=env_name, region=region, proxy=px,
+            group_id=group_id, reuse_env=True, force_new=args.force_new,
+        )
+        env = client.get_env(env_id)
+        print(f"\n- 环境 {env.name} {env.id}（{'新建' if created else '复用'}）")
+        print("- 写入后的代理字段：")
+        print(json.dumps({k: env.raw.get(k) for k in fields},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    launch = bb_cdp.open_for_register(
+        client, proxy=px, region=region, env_name=env_name,
+        group_id=group_id, reuse_env=not args.force_new,
+        force_new=args.force_new,
+    )
+    print("\n- 启动结果：")
+    print(json.dumps(launch.as_dict(), ensure_ascii=False, indent=2))
+    env = client.get_env(launch.env_id)
+    print("- 环境里的代理字段：")
+    print(json.dumps({k: env.raw.get(k) for k in fields},
+                     ensure_ascii=False, indent=2))
+    if args.keep:
+        print(f"\n窗口保持打开：{launch.endpoint}")
+        return 0
+    bb_cdp.close_env(client, launch.env_id)
+    print("\n- 已关闭窗口")
+    return 0
+
+
 # ---------------------------------------------------------------- 解析
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="qoder_register",
@@ -365,8 +768,74 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("mail:pool", help="邮箱池健康与库存")
     s.set_defaults(func=cmd_mail_pool)
 
+    s = sub.add_parser("mail:file",
+                       help="体检/入库 data/emails.txt（email----pass----clientId----refreshToken）")
+    s.add_argument("--file", default="", help="清单路径，默认取 mail.outlook_file")
+    s.add_argument("--import", dest="import_to_db", action="store_true",
+                   help="把清单地址写进数据库邮箱池")
+    s.add_argument("--verify", action="store_true",
+                   help="逐条刷 OAuth 令牌并连 IMAP，验证账号真能用")
+    s.set_defaults(func=cmd_mail_file)
+
     s = sub.add_parser("env:check", help="指纹浏览器/打码/代理/设备自检")
     s.set_defaults(func=cmd_env_check)
+
+    s = sub.add_parser("browser:probe",
+                       help="把本地代理写进比特环境并校验（可选启动）")
+    s.add_argument("--proxy-index", type=int, default=0, help="用第几条代理")
+    s.add_argument("--env-name", default="", help="环境名，留空自动")
+    s.add_argument("--region", default=None)
+    s.add_argument("--launch", action="store_true", help="真的启动并校验 CDP")
+    s.add_argument("--keep", action="store_true", help="启动后不关窗口")
+    s.add_argument("--force-new", action="store_true", help="强制新建环境")
+    s.add_argument("--check-all", action="store_true",
+                   help="先把整池代理并发探活，只报结果")
+    s.add_argument("--proxy", default="",
+                   help="临时指定一条代理（覆盖代理文件），例：h:port:user:pass")
+    s.add_argument("--timeout", type=int, default=15, help="探活超时秒")
+    s.add_argument("--workers", type=int, default=10, help="探活并发")
+    s.add_argument("--reuse", action="store_true",
+                   help="复用指定下标的代理，不从账本里消耗")
+    s.set_defaults(func=cmd_browser_probe)
+
+    s = sub.add_parser("claim:one", help="单账号领取（可自动登录）")
+    s.add_argument("--email", default="")
+    s.add_argument("--password", default="")
+    s.add_argument("--login", action="store_true", default=True,
+                   help="自动登录（需要客户端点一次「登录」拿到链接）")
+    s.add_argument("--no-login", dest="login", action="store_false",
+                   help="跳过登录，直接抓现有 token")
+    s.add_argument("--link-timeout", type=int, default=180)
+    s.add_argument("--login-timeout", type=int, default=300)
+    s.add_argument("--env-name", default="")
+    s.set_defaults(func=cmd_claim_one)
+
+    s = sub.add_parser("export:txt", help="导出账号/token/统计 txt")
+    s.add_argument("--dir", default="", help="输出目录，默认 storage.output_dir")
+    s.set_defaults(func=cmd_export_txt)
+
+    s = sub.add_parser("proxy:gen", help="按模板批量生成新会话代理")
+    s.add_argument("--template", default="")
+    s.add_argument("--user", default="")
+    s.add_argument("--password", default="")
+    s.add_argument("--ttl", type=int, default=0)
+    s.add_argument("--count", type=int, default=0)
+    s.add_argument("--region", default=None)
+    s.add_argument("--file", default="")
+    s.add_argument("--replace", action="store_true", help="覆盖写而不是追加")
+    s.add_argument("--no-verify", action="store_true")
+    s.add_argument("--timeout", type=int, default=15)
+    s.add_argument("--workers", type=int, default=6)
+    s.set_defaults(func=cmd_proxy_gen)
+
+    s = sub.add_parser("proxy:state", help="查看一条一用账本")
+    s.add_argument("--prune", action="store_true")
+    s.add_argument("--keep-hours", type=float, default=168.0)
+    s.set_defaults(func=cmd_proxy_state)
+
+    s = sub.add_parser("client:find", help="自动探测 Qoder 客户端可执行文件")
+    s.add_argument("--path", default="", help="手动指定 exe，覆盖自动探测")
+    s.set_defaults(func=cmd_client_find)
 
     s = sub.add_parser("run:one", help="跑一轮完整循环")
     s.add_argument("--region", default=None)
@@ -427,6 +896,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 密钥从 config/secrets.yaml 灌进环境变量（不覆盖已有值），
+    # 必须在 load_config 之前跑，否则 env:XXX 插值拿到空串
+    try:
+        from app import secrets
+
+        touched = secrets.export_env()
+        if touched:
+            log.debug("secrets 已导入：%s", ", ".join(touched))
+    except Exception:
+        pass
     return args.func(args)
 
 

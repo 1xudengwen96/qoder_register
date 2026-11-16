@@ -10,12 +10,17 @@ concurrency: 1             # 领取阶段强制串行，不要改
 # ------------------------------------------------------------ 邮箱源
 mail:
   # weighted: 按权重取；strict_priority: 按顺序优先耗尽；round_robin: 轮转
-  strategy: weighted
+  strategy: strict_priority   # 先用清单里那 10 个真邮箱，耗尽了再往下掉
+  # IMAP / 2Captcha 走的本机隧道（Clash 之类），留空＝直连
+  imap_proxy: ""
+  # Outlook 清单：email----密码----clientId----refreshToken（一行一个）
+  # 填了就用文件收码；留空回落到数据库邮箱池
+  outlook_file: "data/emails.txt"
   weights:
     outlook_tag: 50
     hotmail: 35
     icloud_relay: 15
-  strict_priority_order: [icloud_relay, hotmail, outlook_tag]
+  strict_priority_order: [outlook_file, outlook_tag, hotmail, icloud_relay]
 
   # 路线 A：Outlook 主号 + tag（name+q001@outlook.com）
   outlook_tag:
@@ -46,8 +51,10 @@ mail:
 # ------------------------------------------------------------ 指纹浏览器
 browser:
   # backend: adspower | bitbrowser | camoufox | playwright
-  # playwright 是零依赖兜底，质量最低；真正跑量建议 adspower / bitbrowser
-  backend: "adspower"
+  backend: "bitbrowser"
+  # cdp_mode: 走原生 CDP（socket 直连），不 spawn node 驱动进程。
+  # 比特 + cdp_mode 时，开窗口前会把代理自动写进环境配置。
+  cdp_mode: true
   headless: false
   storage_root: "data/profiles"
 
@@ -57,6 +64,11 @@ browser:
 
   bitbrowser:
     api_base: "http://127.0.0.1:54345"
+    group_id: ""                 # 留空＝默认分组
+    reuse_env: true              # 同名环境复用（复用也会重写代理）
+    env_id: ""                   # 指定固定环境 id；留空按账号名自动建/找
+    keep_open: false             # 跑完不关窗口（调试用）
+    headless: false              # 比特客户端支持时再开
 
   camoufox:
     os_hint: "windows"
@@ -64,6 +76,7 @@ browser:
 # ------------------------------------------------------------ 注册
 register:
   signup_url: "https://qoder.com/signup"
+  cdp_signup_url: "https://qoder.com/users/sign-up"   # CDP 通道用的真实注册页
   recaptcha_site_key: ""      # 从注册页 DOM 抓，抓到填这里
   hcaptcha_site_key: ""
   turnstile_site_key: ""
@@ -75,6 +88,7 @@ verify:
 # ------------------------------------------------------------ 打码平台
 captcha:
   timeout: 180
+  max_attempts: 6            # 滑块最多重试次数（CDP 通道）
   providers:
     local:
       enabled: true            # 图片验证码走本地 ddddocr，零成本
@@ -102,16 +116,37 @@ device:
 
 # ------------------------------------------------------------ 领取
 claim:
-  client_path: "C:\\Program Files\\Qoder\\Qoder.exe"
+  client_path: ""              # 留空＝自动探测（注册表协议 → 已知布局 → 浅扫）
   data_dir: ""                 # 留空自动探测
   wait_credit_timeout: 120
   capture_token: true
   credit_probe_url: ""         # 抓包拿到的额度接口，填了才能精确核对积分
 
 # ------------------------------------------------------------ 代理
+# 支持格式（一行一条）：
+#   host:port:user:pass           ← 代理商导出的四段冒号（本项目默认用这个）
+#   host:port:user:pass#us        ← 带地区标签，用于对齐时区/语言
+#   http://user:pass@host:port#us
+#   socks5://user:pass@host:port
 proxy:
   source: file
-  file: "data/proxies.txt"     # 每行 http://user:pass@host:port#us
+  file: "data/proxies.txt"
+  default_scheme: "http"       # 四段格式默认当 http 代理
+  strict_region: false
+  # ---- 一条一用：开一个浏览器取一条，用完作废，下一轮换新的
+  one_shot: true
+  state_file: "data/.proxy_state.json"   # 谁用过哪条（落盘，重启不丢）
+  check_before_use: true                  # 取之前先真连一次，死的直接消耗掉
+  check_timeout: 12
+  # ---- 池子空了自动按模板续新会话（ipdeep 每次开窗口换一个 IP）
+  auto_extend: true
+  extend:
+    template: "gate.ipdeep.com:8080:{user}-session-{session}-sessiontime-{ttl}:{password}"
+    user: "d58983490-res-country-{region}"
+    password: "env:IPDEEP_PASS"
+    ttl: 5
+    count: 20
+    verify: true
 
 # ------------------------------------------------------------ 地区画像
 region_profiles:
@@ -126,3 +161,4 @@ region_profiles:
 storage:
   url: "sqlite:///data/qoder.db"
   artifacts_dir: "data/artifacts"
+  output_dir: "data/output"      # 账号/token/统计 txt 输出目录

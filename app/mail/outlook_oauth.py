@@ -212,7 +212,11 @@ def load_accounts(path: str | Path) -> list[MailAccount]:
         return []
     out: list[MailAccount] = []
     for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-        a = parse_line(line)
+        s = line.strip()
+        # 注释/空行跳过：否则 "# 示例 abc@x.com----..." 会被当成真账号
+        if not s or s.startswith(("#", "//", ";")):
+            continue
+        a = parse_line(s)
         if a:
             out.append(a)
     return out
@@ -327,29 +331,45 @@ class OutlookMailbox:
     def connect(self) -> "OutlookMailbox":
         if self.token is None or self.token.expired:
             self.refresh_access_token()
-        # 隧道优先（代理端解析域名，实测 0.3s 建好）；没代理或隧道失败再直连 IPv4
-        try:
-            if self.proxy:
-                conn = ProxiedIMAP4SSL(self.host, 993, proxy=self.proxy,
-                                       timeout=self.timeout)
-            else:
-                conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
-                                       timeout=self.timeout)
-        except Exception:
-            if not self.proxy:
-                raise
-            conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
-                                   timeout=self.timeout)
-        try:
-            self._xoauth2(conn)
-        except Exception:
+        # 微软侧对「短时间内反复刷 token + 立刻 XOAUTH2」会限流，
+        # 表现为 authentication rejected。批量体检/多号连跑时必须退避重试。
+        last: Exception | None = None
+        for attempt in range(3):
+            conn = None
             try:
-                conn.logout()
-            except Exception:
-                conn.shutdown()
-            raise
-        self._conn = conn
-        return self
+                # 隧道优先（代理端解析域名）；没代理或隧道失败再直连 IPv4
+                if self.proxy:
+                    try:
+                        conn = ProxiedIMAP4SSL(self.host, 993, proxy=self.proxy,
+                                               timeout=self.timeout)
+                    except Exception:
+                        conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
+                                               timeout=self.timeout)
+                else:
+                    conn = ProxiedIMAP4SSL(self.host, 993, proxy="",
+                                           timeout=self.timeout)
+                self._xoauth2(conn)
+                self._conn = conn
+                return self
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if conn is not None:
+                    try:
+                        conn.logout()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            conn.shutdown()
+                        except Exception:  # noqa: BLE001
+                            pass
+                if attempt >= 2:
+                    break
+                time.sleep(2 + 3 * attempt)
+                try:
+                    self.token = None
+                    self.refresh_access_token()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise last if last is not None else RuntimeError("IMAP connect failed")
 
     def close(self) -> None:
         if self._conn is None:
