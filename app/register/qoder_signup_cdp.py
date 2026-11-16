@@ -375,6 +375,28 @@ class QoderSignupCDP:
                          err: err, reactKey: !!rkey});
 })()"""
 
+    def _net_log(self, limit: int = 40) -> list[dict]:
+        """把 CDP 收到的网络事件整理成简短列表（诊断提交有没有真的发出去）。"""
+        out: list[dict] = []
+        for ev in list(self.page.cdp.events):
+            method = ev.get("method")
+            params = ev.get("params") or {}
+            if method == "Network.requestWillBeSent":
+                req = params.get("request") or {}
+                url = str(req.get("url") or "")
+                if any(k in url for k in ("/api", "sign", "verify", "otp",
+                                          "captcha", "user")):
+                    out.append({"t": "req", "m": req.get("method"),
+                                "url": url[:140]})
+            elif method == "Network.responseReceived":
+                resp = params.get("response") or {}
+                url = str(resp.get("url") or "")
+                if any(k in url for k in ("/api", "sign", "verify", "otp",
+                                          "captcha", "user")):
+                    out.append({"t": "resp", "s": resp.get("status"),
+                                "url": url[:140]})
+        return out[-limit:]
+
     def _otp_selector(self) -> str:
         for sel in OTP_SELECTORS:
             if self.page.exists(sel):
@@ -471,6 +493,10 @@ class QoderSignupCDP:
         digits = "".join(c for c in code if c.isdigit())[:6]
         before = self.page.eval(JS_VISIBLE_STATE) or {}
         before_url = str(before.get("url") or self.page.url())
+        try:
+            self.page.cdp.call("Network.enable")
+        except Exception:  # noqa: BLE001
+            pass
         sel = self.fill_otp(code)
         self._d(f"填码后 url={before_url} buttons={before.get('buttons')}")
 
@@ -542,9 +568,55 @@ class QoderSignupCDP:
                     self._sleep(3.0, 4.5)
                     moved, state = self._otp_progressed(before_url, before)
 
+        # ⑥ 阿里 Baxia 九宫格点选（风控惩罚页，action=captchaclick）
+        if not moved:
+            from app.register.baxia_cdp import BaxiaClickCaptcha
+
+            bx = BaxiaClickCaptcha(self.page, logger=self.log)
+            if bx.present():
+                ladder.append("baxia")
+                self._d("检测到 Baxia 九宫格点选，走 2Captcha CoordinatesTask")
+                try:
+                    from app import secrets as _secrets
+                    from app.net.twocaptcha_click import TwoCaptchaClick
+
+                    click_cli = TwoCaptchaClick(
+                        _secrets.get("captcha.twocaptcha_key", ""))
+                    out = bx.solve(
+                        click_cli, max_attempts=3,
+                        save_path=str(self.artifacts / "baxia_grid.png"))
+                    self._d(f"Baxia 结果 ok={out.ok} cells={out.cells} "
+                            f"cost=${out.cost:.4f} {out.detail}")
+                    if out.ok:
+                        ladder.append(f"baxia-ok({out.cells})")
+                        self._sleep(3.0, 4.5)
+                        moved, state = self._otp_progressed(before_url, before)
+                except Exception as exc:  # noqa: BLE001
+                    self._d(f"Baxia 处理异常: {type(exc).__name__}: {exc}")
+
         url = str(state.get("url") or self.page.url())
         body = str(state.get("body") or "")
         self._d(f"提交阶梯={ladder} 结果 url={url} moved={moved}")
+
+        # 抓网络与页面提示：判断「提交请求到底发没发、回了什么」
+        net = self._net_log()
+        try:
+            toast = self.page.eval(
+                """(() => Array.from(document.querySelectorAll(
+                    '[class*=message],[class*=alert],[class*=error],'
+                    + '[class*=toast],[role=alert]'))
+                  .map(e => (e.innerText || '').trim()).filter(Boolean)
+                  .slice(0, 5))()""") or []
+        except Exception:
+            toast = []
+        self.report.otp_debug.setdefault("network", net)
+        self.report.otp_debug.setdefault("toast", toast)
+        if net:
+            self._d("网络事件: " + " | ".join(
+                f"{n.get('t')}:{n.get('m') or n.get('s')} {n.get('url')}"
+                for n in net[-6:]))
+        if toast:
+            self._d(f"页面提示: {toast}")
 
         if not moved:
             dbg = self._dump("otp_stuck", JS_DEEP_DUMP)

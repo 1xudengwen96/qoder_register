@@ -288,7 +288,9 @@ def main() -> int:
                 "url": rep.otp_debug.get("url"),
                 "inputs": rep.otp_debug.get("inputs"),
                 "buttons": rep.otp_debug.get("allButtons"),
-            }, ensure_ascii=False, indent=2)[:2000])
+                "toast": rep.otp_debug.get("toast"),
+                "network": rep.otp_debug.get("network"),
+            }, ensure_ascii=False, indent=2)[:3000])
         return 0 if rep.ok else 1
     finally:
         try:

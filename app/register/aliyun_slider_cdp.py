@@ -51,17 +51,21 @@ JS_STATE = """(() => {
 JS_SRCS = """(() => {
   const p = document.querySelector('#aliyunCaptcha-puzzle');
   const i = document.querySelector('#aliyunCaptcha-img');
-  const b = (e) => {
+  const box = (e) => {
     if (!e) return null;
     const r = e.getBoundingClientRect();
     return {x: r.x, y: r.y, w: r.width, h: r.height};
   };
+  // 真正的显示区域是 .puzzle 容器（img 被设成 display:none）
+  const cont = p ? p.parentElement : null;
   return {
     pzSrc: p ? (p.src || '') : '',
     bgSrc: i ? (i.src || '') : '',
     bgNatural: i ? [i.naturalWidth, i.naturalHeight] : null,
-    bgBox: b(i),
-    pzBox: b(p),
+    bgBox: box(cont) || box(i),
+    pzBox: box(p) || {w: 52, h: 52},
+    contCls: cont ? String(cont.className || '') : '',
+    imgDisplay: i ? getComputedStyle(i).display : '',
   };
 })()"""
 
@@ -102,11 +106,37 @@ JS_IMAGES_READY = """(() => {
   const i = document.querySelector('#aliyunCaptcha-img');
   const p = document.querySelector('#aliyunCaptcha-puzzle');
   const s = document.querySelector('#aliyunCaptcha-sliding-slider');
+  const w = document.querySelector('#aliyunCaptcha-window-float');
   if (!i || !p || !s) return false;
-  return i.complete && i.naturalWidth > 0 &&
-         p.complete && p.naturalWidth > 0 &&
-         i.getBoundingClientRect().width > 100 &&
+  const shown = !!(w && w.classList.contains('window-show'));
+  // 不检查 img 的尺寸：比特浏览器把 <img> 设成 display:none，
+  // 真实显示区是 .puzzle 容器；这里只要求「有 src + 窗口已展开 + 滑块可见」
+  return shown && !!i.src && !!p.src &&
          s.getBoundingClientRect().width > 0;
+})()"""
+
+JS_GRAB_SRCS = r"""(async () => {
+  const toDataUrl = async (sel) => {
+    const e = document.querySelector(sel);
+    if (!e || !e.src) return '';
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 6000);   // 别让代理卡住整轮
+    try {
+      const r = await fetch(e.src, {cache: 'no-store', signal: ctl.signal});
+      const b = await r.blob();
+      return await new Promise(res => {
+        const fr = new FileReader();
+        fr.onload = () => res(String(fr.result || ''));
+        fr.onerror = () => res('');
+        fr.readAsDataURL(b);
+      });
+    } catch (err) { return ''; }
+    finally { clearTimeout(timer); }
+  };
+  return {
+    bg: await toDataUrl('#aliyunCaptcha-img'),
+    pz: await toDataUrl('#aliyunCaptcha-puzzle'),
+  };
 })()"""
 
 
@@ -142,26 +172,32 @@ class AliyunSliderCDP:
             self.log.info("[slider-cdp] %s", msg)
 
     # ---------------------------------------------------------- 展开
-    def expand(self, max_try: int = 3) -> bool:
+    def expand(self, max_try: int = 4) -> bool:
         """确保滑块面板打开且图片就绪。
 
-        踩坑：``#captcha-element`` 是**开关**，连着点会把面板点开又点关，
-        最后一直卡在"窗口没起来"。所以先判就绪，没就绪才点，且每次点完
-        老老实实等图片加载。
+        实测：`#captcha-element` 是外层容器，点它不一定能展开；
+        真正可点的是 `#aliyunCaptcha-captcha-left`（"Click to verify" 药丸）
+        和 `#aliyunCaptcha-captcha-body`。所以按顺序试，每次点完等图加载，
+        不要连点（连点会把它点开又点关）。
         """
         if self.page.wait_js(JS_IMAGES_READY, timeout=3):
             return True
 
+        candidates = (SEL["collapse"], "#aliyunCaptcha-captcha-body",
+                      SEL["captcha_btn"])
         for attempt in range(1, max_try + 1):
-            if self.page.click(SEL["captcha_btn"], human=self.human, timeout=3):
-                self._d(f"第 {attempt} 次点展开键")
-            else:
-                self.page.click(SEL["collapse"], human=self.human, timeout=2)
-            if self.page.wait_js(JS_IMAGES_READY, timeout=8):
-                return True
-            # 面板可能是被上一次点击关上的，再补一次
-            self.page.click(SEL["collapse"], human=self.human, timeout=2)
-            if self.page.wait_js(JS_IMAGES_READY, timeout=6):
+            for sel in candidates:
+                if not self.page.exists(sel):
+                    continue
+                r = self.page.rect(sel)
+                if not r or r.w < 5 or r.h < 5:
+                    continue
+                self._d(f"第 {attempt} 轮点 {sel} ({r.w:.0f}x{r.h:.0f})")
+                self.page.click_xy(r.cx, r.cy, human=self.human)
+                if self.page.wait_js(JS_IMAGES_READY, timeout=10):
+                    return True
+            # 面板可能被上一轮点关了，给一次纯等待
+            if self.page.wait_js(JS_IMAGES_READY, timeout=4):
                 return True
 
         st = self.page.eval(JS_STATE) or {}
@@ -174,6 +210,13 @@ class AliyunSliderCDP:
 
     # ---------------------------------------------------------- 取图
     def grab_images(self, wait_src: float = 15.0):
+        """取背景图与拼图块。
+
+        两条路：
+        1. 页面内 fetch 成 dataURL（首选 —— 比特浏览器会拦 <img> 加载，
+           naturalWidth 恒 0，但 fetch 是通的）
+        2. 退回到 Python 侧按 URL 下载（带代理）
+        """
         deadline = time.time() + wait_src
         last = None
         while time.time() < deadline:
@@ -181,14 +224,23 @@ class AliyunSliderCDP:
             last = data
             bg_src = (data.get("bgSrc") or "").strip()
             pz_src = (data.get("pzSrc") or "").strip()
-            if ((bg_src.startswith("data:") or bg_src.startswith("http")) and
-                    (pz_src.startswith("data:") or pz_src.startswith("http"))):
+            if bg_src and pz_src:
+                grabbed = self.page.eval(JS_GRAB_SRCS, await_promise=True) or {}
+                bg_d = (grabbed.get("bg") or "")
+                pz_d = (grabbed.get("pz") or "")
+                if bg_d.startswith("data:") and pz_d.startswith("data:"):
+                    bg = captcha_vision.decode_data_url(bg_d)
+                    pz = captcha_vision.decode_data_url(pz_d)
+                    if bg is not None and pz is not None:
+                        self._d("取图: 页面内 fetch 成功")
+                        return bg, pz, data
                 bg = captcha_vision.load_image_src(bg_src, proxy=self.proxy)
                 pz = captcha_vision.load_image_src(pz_src, proxy=self.proxy)
                 if bg is not None and pz is not None:
+                    self._d("取图: Python 侧下载成功")
                     return bg, pz, data
                 self._d(f"图片解码失败 bg={bg_src[:50]} pz={pz_src[:50]}")
-            time.sleep(0.6)
+            time.sleep(0.8)
         if last:
             self._d(f"等 src 超时 bg={(last.get('bgSrc') or '')[:50]}")
         return None
@@ -204,18 +256,25 @@ class AliyunSliderCDP:
         pw = pz_c.size[0]
         bbox_y = bbox[1]
 
+        # 自然像素 → 显示像素的缩放（.puzzle 容器宽 / 图宽）
+        disp_w = float((_data.get("bgBox") or {}).get("w") or bg_w or 1)
+        scale = (disp_w / bg_w) if bg_w else 1.0
+        self._d(f"图宽 {bg_w} 显示宽 {disp_w:.0f} scale={scale:.3f} "
+                f"拼图 {pw}x{pz_c.size[1]}")
+
         if self.prefer_paid:
             try:
                 sol = self.paid.solve(bg, pz_c)
                 if sol.ok:
                     self.total_cost += sol.cost
-                    # 2Captcha 给的是拼图块目标中心 x，减半宽得左沿
-                    x_left = sol.x - pw / 2.0
-                    x_left = min(max(0.0, x_left), float(bg_w - pw))
+                    # 2Captcha 给的是拼图块目标中心 x（自然像素），换到显示坐标
+                    x_left = (sol.x - pw / 2.0) * scale
+                    limit = max(0.0, disp_w - pw * scale)
+                    x_left = min(max(0.0, x_left), limit)
                     dy = abs(sol.y - bbox_y)
                     self._d(f"2Captcha 中心 x={sol.x:.0f} y={sol.y:.0f} "
-                            f"(bbox_y={bbox_y} dy={dy:.0f}) → 左沿 {x_left:.1f} "
-                            f"耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}")
+                            f"(bbox_y={bbox_y} dy={dy:.0f}) → 左沿 {x_left:.1f}"
+                            f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}")
                     return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
                 self._d(f"2Captcha 失败: {sol.error}")
             except Exception as exc:
@@ -224,7 +283,7 @@ class AliyunSliderCDP:
                 self._d("付费识别未拿到坐标，按配置不回落本地")
                 return None
 
-        gap = captcha_vision.find_gap(bg, pz, display_w=None)
+        gap = captcha_vision.find_gap(bg, pz, display_w=disp_w)
         if gap.ok:
             return gap.x_display, f"local-{gap.method}", 0.0
         self._d(f"本地识别失败: {gap.detail}")
@@ -244,7 +303,9 @@ class AliyunSliderCDP:
             return False, 0.0
 
         bg_box = data.get("bgBox") or {"w": 300}
-        pz_box = data.get("pzBox") or {"w": 52}
+        pz_box = dict(data.get("pzBox") or {"w": 52})
+        if float(pz_box.get("w") or 0) < 5:      # 拼图元素被隐藏时给个估计值
+            pz_box["w"] = 52
         sx = slider["x"] + slider["w"] / 2
         sy = slider["y"] + slider["h"] / 2
         track_w = max(track["w"], 1)
@@ -271,28 +332,42 @@ class AliyunSliderCDP:
                 time.sleep(random.uniform(0.02, 0.05))
 
         cur_x = sx
-        for _ in range(140):
-            cur_left = float(self.page.eval(JS_PZ_LEFT) or 0.0)
-            remaining = target_left - cur_left
-            if abs(remaining) <= 1.0:
-                break
-            dist = abs(remaining)
-            cap = 22 if dist > 60 else 12 if dist > 20 else 5 if dist > 6 else 2
-            dx = max(-cap, min(cap, remaining * ratio))
+        # ---- 开环拖动：按 track/bg 比例算出滑块要走的像素，缓动过去 ----
+        total = max(-track_w, min(track_w, target_left * ratio))
+        steps = max(24, int(abs(total) / 6))
+        self._d(f"开环拖动 total={total:.1f}px steps={steps} ratio={ratio:.2f}")
+        for i in range(1, steps + 1):
+            t = i / steps
+            eased = 1 - (1 - t) ** 2.2
+            x = sx + total * eased
             if self.human:
-                dx += random.uniform(-0.4, 0.4)
-            cur_x = max(track["x"], min(track["x"] + track_w, cur_x + dx))
+                x += random.uniform(-0.6, 0.6)
+            cur_x = x
             self.page.move(cur_x, sy + random.uniform(-0.6, 0.6), buttons=1)
-            base = 0.010 if dist > 40 else (0.018 if dist > 12 else 0.030)
-            time.sleep(base * random.uniform(0.8, 1.4))
+            time.sleep(random.uniform(0.012, 0.028) * (1.6 if i < steps * 0.3 else 1.0))
+
+        # ---- 闭环修正：只有 style.left 真的在变时才用（新版本可能不写它）----
+        for _ in range(24):
+            cur_left = float(self.page.eval(JS_PZ_LEFT) or 0.0)
+            if cur_left <= 0.5:
+                break                      # 反馈不可用，跳过
+            remaining = target_left - cur_left
+            if abs(remaining) <= 1.5:
+                break
+            dx = max(-8.0, min(8.0, remaining * ratio))
+            cur_x = max(track["x"], min(track["x"] + track_w, cur_x + dx))
+            self.page.move(cur_x, sy + random.uniform(-0.5, 0.5), buttons=1)
+            time.sleep(random.uniform(0.02, 0.04))
 
         final = float(self.page.eval(JS_PZ_LEFT) or 0.0)
-        self._d(f"拖动完成 left={final:.1f} target={target_left:.1f}")
+        moved = final if final > 0.5 else (cur_x - sx) / max(ratio, 1e-6)
+        self._d(f"拖动完成 left={final:.1f} 估计位移={moved:.1f} "
+                f"target={target_left:.1f}")
         if self.human:
             time.sleep(random.uniform(0.12, 0.28))
         self.page.mouse("mouseReleased", cur_x, sy, buttons=0)
         time.sleep(random.uniform(3.0, 4.5))
-        return abs(final - target_left) <= 3.0, final
+        return abs(moved - target_left) <= 6.0, moved
 
     # ---------------------------------------------------------- 检查/换题
     def check(self) -> dict:
