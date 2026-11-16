@@ -332,19 +332,24 @@ class AliyunSliderCDP:
                 time.sleep(random.uniform(0.02, 0.05))
 
         cur_x = sx
-        # ---- 开环拖动：按 track/bg 比例算出滑块要走的像素，缓动过去 ----
+        # ---- 开环拖动：真人节奏（1.1~1.9s，缓入缓出，中途小停顿）----
         total = max(-track_w, min(track_w, target_left * ratio))
-        steps = max(24, int(abs(total) / 6))
-        self._d(f"开环拖动 total={total:.1f}px steps={steps} ratio={ratio:.2f}")
+        duration = random.uniform(1.1, 1.9)
+        steps = max(40, int(abs(total) / 2))
+        pause_at = random.randint(int(steps * 0.55), int(steps * 0.8))
+        self._d(f"开环拖动 total={total:.1f}px steps={steps} "
+                f"dur={duration:.2f}s ratio={ratio:.2f}")
         for i in range(1, steps + 1):
             t = i / steps
-            eased = 1 - (1 - t) ** 2.2
+            eased = t * t * (3 - 2 * t)          # ease-in-out
             x = sx + total * eased
             if self.human:
-                x += random.uniform(-0.6, 0.6)
+                x += random.uniform(-0.35, 0.35)
             cur_x = x
-            self.page.move(cur_x, sy + random.uniform(-0.6, 0.6), buttons=1)
-            time.sleep(random.uniform(0.012, 0.028) * (1.6 if i < steps * 0.3 else 1.0))
+            self.page.move(cur_x, sy + random.uniform(-0.4, 0.4), buttons=1)
+            time.sleep(duration / steps * random.uniform(0.75, 1.25))
+            if i == pause_at:
+                time.sleep(random.uniform(0.08, 0.16))   # 中途迟疑
 
         # ---- 闭环修正：只有 style.left 真的在变时才用（新版本可能不写它）----
         for _ in range(24):
@@ -364,7 +369,7 @@ class AliyunSliderCDP:
         self._d(f"拖动完成 left={final:.1f} 估计位移={moved:.1f} "
                 f"target={target_left:.1f}")
         if self.human:
-            time.sleep(random.uniform(0.12, 0.28))
+            time.sleep(random.uniform(0.35, 0.6))     # 松手前停一下
         self.page.mouse("mouseReleased", cur_x, sy, buttons=0)
         time.sleep(random.uniform(3.0, 4.5))
         return abs(moved - target_left) <= 6.0, moved

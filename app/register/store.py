@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 JSONL = DATA / "registered.jsonl"
 TXT = DATA / "accounts.txt"
