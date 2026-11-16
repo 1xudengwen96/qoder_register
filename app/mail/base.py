@@ -45,6 +45,7 @@ class MailMessage:
     body_text: str
     body_html: str
     received_at: datetime | None = None
+    raw_headers: str = ""               # 原始头（转发链里常有原始收件地址）
 
     def links(self) -> list[str]:
         out: list[str] = []

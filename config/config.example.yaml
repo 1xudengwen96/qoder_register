@@ -38,15 +38,27 @@ mail:
   hotmail:
     credentials_file: "data/hotmail_accounts.csv"
 
-  # 路线 C：iCloud「隐藏我的邮件」，统一转发到聚合邮箱
+  # 路线 C：iCloud+「隐藏我的邮件」，全部转发到同一个聚合收件箱
+  #   - 隐藏地址：一行一个 xxx@privaterelay.appleid.com（也可写裸用户名）
+  #   - 聚合收件箱：QQ 邮箱 IMAP（imap.qq.com:993，密码填「授权码」不是登录密码）
   icloud_relay:
-    relay_addresses_file: "data/icloud_relay.txt"   # 一行一个 xxx@privaterelay.appleid.com
+    relay_addresses_file: "data/icloud_relay.txt"
+    quota_total: 500
     aggregator_imap:
-      user: "agg@outlook.com"
-      password: "env:AGG_IMAP_PW"
-      host: "outlook.office365.com"
+      host: "imap.qq.com"           # QQ 邮箱；苹果自家邮箱用 imap.mail.me.com
       port: 993
-    quota_total: 100
+      user: "填你的QQ邮箱@qq.com"
+      password: "env:QQ_IMAP_PASS"  # QQ「设置-账户-IMAP/SMTP」里生成的授权码
+      folder: "INBOX"
+      imap_id: ""                   # 留空用默认 ID；部分服务端要求登录后发 ID
+    # 收码匹配规则（按邮件服务商微调）
+    match:
+      sender_allow: ["qoder.com"]           # 发件人包含这些域才算
+      subject_contains: ["qoder"]           # 主题或正文命中
+      code_regex: "\\b(\\d{6})\\b"          # 验证码正则，第一个分组为准
+      scan_body_for_recipient: true         # 正文里找隐藏地址（转发链常写进页脚）
+      lookback: 60                          # 每次轮询只看最近 N 封
+      extra_recipient_headers: []           # 追加要扫的收件人头，如 ["X-Forwarded-To"]
 
 # ------------------------------------------------------------ 指纹浏览器
 browser:

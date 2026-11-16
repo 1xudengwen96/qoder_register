@@ -63,16 +63,22 @@ def build_mail_layer(cfg, db) -> MailAggregator:
 
     ic_cfg = get(cfg, "mail.icloud_relay")
     if ic_cfg and get(ic_cfg, "relay_addresses_file"):
-        providers["icloud_relay"] = ICloudRelayProvider(
+        from app.mail.relay_qq import ICloudRelayQQProvider, RelayMatchRules
+
+        agg = to_plain(get(ic_cfg, "aggregator_imap", {}) or {})
+        rules_raw = to_plain(get(ic_cfg, "match", {}) or {})
+        providers["icloud_relay"] = ICloudRelayQQProvider(
             relay_addresses_file=ic_cfg.relay_addresses_file,
-            aggregator_imap={
-                "user": get(ic_cfg, "aggregator_imap.user", ""),
-                "password": get(ic_cfg, "aggregator_imap.password", ""),
-                "host": get(ic_cfg, "aggregator_imap.host", "imap.mail.me.com"),
-                "port": int(get(ic_cfg, "aggregator_imap.port", 993)),
-            },
-            quota_total=int(get(ic_cfg, "quota_total", 100)),
+            imap_host=str(agg.get("host") or "imap.qq.com"),
+            imap_port=int(agg.get("port") or 993),
+            imap_user=str(agg.get("user") or ""),
+            imap_password=str(agg.get("password") or ""),
+            folder=str(agg.get("folder") or "INBOX"),
+            imap_id=str(agg.get("imap_id") or ""),
+            quota_total=int(get(ic_cfg, "quota_total", 500)),
             taken_addresses=taken,
+            rules=RelayMatchRules.from_config(rules_raw
+                                             if isinstance(rules_raw, dict) else {}),
         )
 
     strategy = get(cfg, "mail.strategy", "weighted")

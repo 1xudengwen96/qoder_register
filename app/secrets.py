@@ -31,6 +31,9 @@ ENV_MAP = {
     "ipdeep.pass": "IPDEEP_PASS",
     "mail.outlook_file": "QODER_MAIL_FILE",
     "bitbrowser.env_id": "BITBROWSER_ENV_ID",
+    # iCloud 隐藏地址聚合箱（QQ 邮箱）
+    "mail.icloud_relay.aggregator_imap.user": "QQ_IMAP_USER",
+    "mail.icloud_relay.aggregator_imap.password": "QQ_IMAP_PASS",
 }
 
 _cache: dict | None = None
