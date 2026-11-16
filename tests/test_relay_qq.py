@@ -115,6 +115,24 @@ class TestCodeRules(unittest.TestCase):
         self.assertEqual(rules.subject_contains, ("verify",))
         self.assertEqual(rules.lookback, 20)
 
+    def test_ignore_color_and_order_numbers(self):
+        """HTML 里的颜色值/订单号不能当验证码。"""
+        html = ('<div style="color:#1a2b3c">订单号 202411 已创建</div>'
+                '<p>Your verification code is <b>376746</b>.</p>')
+        msg = mk(["relay.one@privaterelay.appleid.com"], body=html)
+        self.assertEqual(guess_code(msg, RelayMatchRules()), "376746")
+
+    def test_subject_code_wins(self):
+        msg = mk(["relay.one@privaterelay.appleid.com"],
+                 body="订单 998877 已发货",
+                 subject="Your Qoder code 445566")
+        self.assertEqual(guess_code(msg, RelayMatchRules()), "445566")
+
+    def test_no_code_returns_empty(self):
+        msg = mk(["relay.one@privaterelay.appleid.com"],
+                 body="欢迎使用，编号 123456789")
+        self.assertEqual(guess_code(msg, RelayMatchRules()), "")
+
 
 class TestProvider(unittest.TestCase):
     def _provider(self, folder: Path) -> ICloudRelayQQProvider:

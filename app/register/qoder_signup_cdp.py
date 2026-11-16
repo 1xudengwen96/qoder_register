@@ -342,9 +342,9 @@ class QoderSignupCDP:
 
     # ---------------------------------------------------------- ④
     JS_OTP_FILL = """(() => {
-  const e = document.querySelector(%s);
+  const e = document.querySelector(__SEL__);
   if (!e) return 'no-input';
-  const code = %s;
+  const code = __CODE__;
   e.focus();
   const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value').set;
@@ -358,7 +358,7 @@ class QoderSignupCDP:
       inputType: 'insertText', data: code}));
   e.dispatchEvent(new Event('change', {bubbles: true}));
 
-  // 2) 直接调 React 的 onChange —— 受控组件只有这条 100% 生效
+  // 2) 直接调 React 的 onChange —— 受控组件只有这条必定生效
   const rkey = Object.keys(e).find(k => k.startsWith('__reactProps$'));
   let fired = false, err = '';
   if (rkey) {
@@ -380,6 +380,13 @@ class QoderSignupCDP:
             if self.page.exists(sel):
                 return sel
         return ""
+
+
+    def _js_otp_fill(self, selector_json: str, code_json: str) -> str:
+        """安全渲染 JS_OTP_FILL（不要用 % 格式化：模板里有字面 % 会炸）。"""
+        return (self.JS_OTP_FILL
+                .replace("__SEL__", selector_json)
+                .replace("__CODE__", code_json))
 
     def fill_otp(self, code: str) -> str:
         """把 6 位码灌进 OTP 框：真键盘 → 原生 setter → 直接调 React onChange。
@@ -410,7 +417,7 @@ class QoderSignupCDP:
 
         # 2) 原生 setter + InputEvent + React onChange
         try:
-            out = self.page.eval(self.JS_OTP_FILL % (s, json.dumps(target)))
+            out = self.page.eval(self._js_otp_fill(s, json.dumps(target)))
             self._d(f"React 注入: {out}")
         except Exception as exc:  # noqa: BLE001
             self._d(f"React 注入异常: {type(exc).__name__}: {exc}")
@@ -494,8 +501,9 @@ class QoderSignupCDP:
                 if not sel2:
                     break
                 try:
-                    self.page.eval(self.JS_OTP_FILL % (json.dumps(sel2),
-                                                       json.dumps(digits)))
+                    self.page.eval(
+                        self._js_otp_fill(json.dumps(sel2),
+                                          json.dumps(digits)))
                 except Exception:  # noqa: BLE001
                     pass
                 self._sleep(0.4, 0.8)
@@ -521,6 +529,18 @@ class QoderSignupCDP:
                 pass
             self._sleep(2.0, 3.0)
             moved, state = self._otp_progressed(before_url, before)
+
+        # ⑤ OTP 之后可能再弹一次滑块（实测存在，别漏）
+        if not moved:
+            has_cap = self.page.wait_js(
+                "(() => !!document.querySelector('#aliyunCaptcha-img') || "
+                "!!document.querySelector('#captcha-element'))()", timeout=5)
+            if has_cap:
+                ladder.append("captcha")
+                self._d("OTP 后又出现验证码，再解一次")
+                if self.step_captcha():
+                    self._sleep(3.0, 4.5)
+                    moved, state = self._otp_progressed(before_url, before)
 
         url = str(state.get("url") or self.page.url())
         body = str(state.get("body") or "")

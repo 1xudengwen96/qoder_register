@@ -248,6 +248,24 @@ def main() -> int:
         rep = flow.run(target_email, code_provider=code_provider,
                        stop_before=args.stop_at)
 
+        # 注册成功必须落库，否则账号就丢了
+        if rep.ok and rep.result:
+            from app.register.store import save_registered
+
+            px = ""
+            try:
+                _env = BitBrowserClient().get_env(args.env_id)
+                px = f"{_env.host}:{_env.port}"
+            except Exception:
+                pass
+            saved = save_registered(
+                email=rep.result.email, password=rep.result.password,
+                first=rep.result.first_name, last=rep.result.last_name,
+                env_id=args.env_id, proxy=px,
+                source=("icloud_relay" if relay else "outlook"))
+            print(f"\n已保存账号 -> {saved['jsonl']}  (db_id={saved['db_id']})")
+            print(f"           -> {saved['txt']}")
+
         print("\n=== 阶段 ===")
         for st in rep.stages:
             print(f"  {'PASS' if st.ok else 'FAIL'}  {st.name:14s} "

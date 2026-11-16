@@ -172,14 +172,29 @@ class RelayInbox:
                     if isinstance(p, tuple) and len(p) >= 2), None)
         if raw is None:
             return None
+        return self._parse(uid, raw)
+
+    def fetch_headers(self, uid: int) -> MailMessage | None:
+        """只取头部（BODY.PEEK[HEADER]）——判断收件人够用了，比整封快一个量级。"""
+        assert self._conn is not None
+        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[HEADER])")
+        if typ != "OK" or not data:
+            return None
+        raw = next((p[1] for p in data
+                    if isinstance(p, tuple) and len(p) >= 2), None)
+        if raw is None:
+            return None
+        return self._parse(uid, raw, headers_only=True)
+
+    def _parse(self, uid: int, raw: bytes,
+               headers_only: bool = False) -> MailMessage:
         parsed = email.message_from_bytes(raw)
-        text, html = _body_of(parsed)
+        text, html = ("", "") if headers_only else _body_of(parsed)
 
         to_list: list[str] = []
         header_blob: list[str] = []
         for name in RECIPIENT_HEADERS + ("From", "Subject"):
-            vals = parsed.get_all(name) or []
-            for v in vals:
+            for v in (parsed.get_all(name) or []):
                 header_blob.append(_decode(v))
         to_raw = _decode(parsed.get("To", ""))
         to_list = [a.strip() for a in to_raw.split(",") if a.strip()]
@@ -188,7 +203,7 @@ class RelayInbox:
             if v:
                 to_list.append(v)
 
-        msg = MailMessage(
+        return MailMessage(
             uid=str(uid),
             mailbox=self.folder,
             to=to_list,
@@ -200,7 +215,21 @@ class RelayInbox:
             # 原文头单独留一份，供收件人匹配用（不塞进 to，避免污染语义）
             raw_headers="\n".join(header_blob),
         )
-        return msg
+
+    def search_recipient(self, address: str) -> list[int]:
+        """服务器端按收件人搜索（UID SEARCH HEADER To）。有些服务端不支持，返回空即可。"""
+        assert self._conn is not None
+        quoted = f'"{address}"'
+        for criteria in (("HEADER", "To", quoted),
+                         ("HEADER", "Delivered-To", quoted),
+                         ("TEXT", quoted)):
+            try:
+                typ, data = self._conn.uid("SEARCH", None, *criteria)
+            except Exception:
+                continue
+            if typ == "OK" and data and data[0]:
+                return [int(x) for x in data[0].split() if x.isdigit()]
+        return []
 
     def recent(self, limit: int = 60) -> list[MailMessage]:
         uids = self.uid_list()[-limit:]
@@ -213,17 +242,64 @@ class RelayInbox:
 
 
 # ============================================================ 判定
+CODE_KEYWORDS = ("code", "verification", "verify", "otp", "pin",
+                 "验证码", "校验码", "动态码")
+CODE_NOISE_PREFIX = ("#", "order", "no.", "id", "invoice", "ticket", "tel",
+                     "phone", "价格", "订单")
+
+
+def _strip_tags(html: str) -> str:
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+
 def guess_code(msg: MailMessage, rules: RelayMatchRules) -> str:
+    """从邮件里挑出验证码。
+
+    踩过的坑：直接在 HTML 里跑 ``\\b(\\d{6})\\b`` 会撞上无关数字
+    （颜色值 ``#1a2b3c``、订单号、工单号、电话号码片段），拿到错码后提交失败。
+    所以改成「候选打分」：
+
+    - 先去掉标签，HTML 只留可见文本
+    - 关键词（code / verification / 验证码 …）附近 +3
+    - 出现在主题里 +2
+    - 紧跟在 ``#``/order/id/订单 等噪声词后 −3
+    - 分数相同取最先出现的
+    """
     try:
         pattern = re.compile(rules.code_regex)
     except re.error:
         pattern = re.compile(DEFAULT_CODE_RE)
-    for blob in (msg.body_text or "", msg.body_html or "",
-                 msg.subject or ""):
-        m = pattern.search(blob)
-        if m:
-            return m.group(1) if m.groups() else m.group(0)
-    return ""
+
+    blobs: list[tuple[str, int]] = []
+    if msg.subject:
+        blobs.append((msg.subject, 2))
+    if msg.body_text:
+        blobs.append((msg.body_text, 0))
+    if msg.body_html:
+        blobs.append((_strip_tags(msg.body_html), 0))
+
+    best_code, best_score = "", -10 ** 9
+    for text, base in blobs:
+        low = text.lower()
+        for m in pattern.finditer(text):
+            code = m.group(1) if m.groups() else m.group(0)
+            start, end = m.span()
+            score = base
+            window = low[max(0, start - 80):min(len(low), end + 80)]
+            if any(k in window for k in CODE_KEYWORDS):
+                score += 3
+            before = low[max(0, start - 12):start]
+            if any(b in before for b in CODE_NOISE_PREFIX):
+                score -= 3
+            if text[max(0, start - 1):start] == "#":      # 颜色值
+                score -= 5
+            if re.search(r"\d{7,}", text[max(0, start - 2):end + 2]):
+                score -= 2                                # 长数字串片段
+            if score > best_score:
+                best_code, best_score = code, score
+    return best_code
 
 
 def looks_like_code_mail(msg: MailMessage, rules: RelayMatchRules) -> bool:
@@ -326,12 +402,16 @@ class ICloudRelayQQProvider:
                           timeout=self.timeout, imap_id=self.imap_id)
 
     def find_code(self, address: str) -> str:
-        """在整个聚合箱里找这个隐藏地址的验证码。"""
+        """在整个聚合箱里找这个隐藏地址的验证码（服务器端搜索优先）。"""
         with self.inbox() as box:
-            for msg in reversed(box.recent(self.rules.lookback)):
-                if not recipient_hits(msg, address, self.rules):
+            hits = box.search_recipient(address)
+            cand = sorted(set(hits))[-10:] if hits else box.uid_list()[-20:]
+            for uid in reversed(cand):
+                hdr = box.fetch_headers(uid)
+                if hdr is None or not recipient_hits(hdr, address, self.rules):
                     continue
-                if not looks_like_code_mail(msg, self.rules):
+                msg = box.fetch(uid)
+                if msg is None or not looks_like_code_mail(msg, self.rules):
                     continue
                 code = guess_code(msg, self.rules)
                 if code:
@@ -340,14 +420,42 @@ class ICloudRelayQQProvider:
 
     def wait_for_mail(self, ident: MailIdentity, timeout: int = 600,
                       match: Callable[[MailMessage], bool] | None = None,
-                      poll_interval: int = 8) -> MailMessage | None:
-        """阻塞等待该地址的验证码邮件，返回 MailMessage（正文含码）。"""
+                      poll_interval: int = 4) -> MailMessage | None:
+        """阻塞等待该地址的验证码邮件。
+
+        性能要点（实测把 160s 的等待压到十几秒）：
+        1. 第一轮用服务器端 ``UID SEARCH HEADER To "<别名>"`` 直接定位，
+           再并上最近 ``lookback`` 封；
+        2. 之后只扫 **水位线以上** 的新邮件，不重复拉旧信；
+        3. 先取 ``BODY.PEEK[HEADER]`` 判收件人，命中才拉整封。
+        """
         deadline = time.time() + timeout
+        watermark = -1
+        scanned: set[int] = set()
         while time.time() < deadline:
             try:
                 with self.inbox() as box:
-                    for msg in reversed(box.recent(self.rules.lookback)):
-                        if not recipient_hits(msg, ident.address, self.rules):
+                    if watermark < 0:
+                        hits = box.search_recipient(ident.address)
+                        recent = box.uid_list()[-self.rules.lookback:]
+                        cand = sorted(set(hits) | set(recent))
+                        watermark = max(recent) if recent else 0
+                    else:
+                        all_uids = box.uid_list()
+                        cand = [u for u in all_uids if u > watermark]
+                        if cand:
+                            watermark = max(cand)
+                    for uid in reversed(cand):
+                        if uid in scanned:
+                            continue
+                        scanned.add(uid)
+                        hdr = box.fetch_headers(uid)
+                        if hdr is None:
+                            continue
+                        if not recipient_hits(hdr, ident.address, self.rules):
+                            continue
+                        msg = box.fetch(uid)
+                        if msg is None:
                             continue
                         if match is not None and not match(msg):
                             continue

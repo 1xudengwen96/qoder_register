@@ -402,10 +402,14 @@ def _parse_lines(text: str) -> list[ProxyInfo]:
                 url = line if "://" in line else "http://" + line
                 u = urllib.parse.urlparse(url)
                 if u.hostname and u.port:
+                    proto = (u.scheme or "http").lower()
+                    if proto.startswith("socks"):
+                        proto = "socks5"
                     out.append(ProxyInfo(
                         host=u.hostname, port=int(u.port),
                         username=urllib.parse.unquote(u.username or ""),
-                        password=urllib.parse.unquote(u.password or "")))
+                        password=urllib.parse.unquote(u.password or ""),
+                        protocol=proto))
                 continue
             parts = line.split(":")
             if len(parts) == 4:
