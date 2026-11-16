@@ -50,9 +50,15 @@ RECIPIENT_HEADERS = (
 # ============================================================ 配置
 @dataclass(slots=True)
 class RelayMatchRules:
-    """匹配规则（全部来自配置，方便按邮件服务商微调）。"""
+    """匹配规则（全部来自配置，方便按邮件服务商微调）。
 
-    sender_allow: tuple[str, ...] = ("qoder.com",)
+    注意：iCloud 转发会**改写发件人** —— ``no-reply@qoder.com`` 到聚合箱时
+    变成 ``no-reply_at_qoder_com_xxxx@icloud.com``（``.`` 换成 ``_``，加随机尾）。
+    所以 ``sender_allow`` 要用**不含点的裸关键词**（如 ``qoder``），
+    写成 ``qoder.com`` 会全部失配。
+    """
+
+    sender_allow: tuple[str, ...] = ("qoder",)
     subject_contains: tuple[str, ...] = ("qoder",)
     code_regex: str = DEFAULT_CODE_RE
     scan_body_for_recipient: bool = True
@@ -68,7 +74,7 @@ class RelayMatchRules:
                 return tuple(x.strip() for x in val.split(",") if x.strip())
             return tuple(val or default)
         return cls(
-            sender_allow=_tup("sender_allow", ("qoder.com",)),
+            sender_allow=_tup("sender_allow", ("qoder",)),
             subject_contains=_tup("subject_contains", ("qoder",)),
             code_regex=d.get("code_regex") or DEFAULT_CODE_RE,
             scan_body_for_recipient=bool(d.get("scan_body_for_recipient", True)),

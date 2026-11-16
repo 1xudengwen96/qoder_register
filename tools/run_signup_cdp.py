@@ -56,6 +56,14 @@ def resolve_endpoint(env_id: str, cdp: str) -> tuple[str, object]:
     env = client.get_env(env_id)
     print(f"环境 {env.id} {env.name} proxyMethod={env.proxy_method} "
           f"{env.host}:{env.port}")
+    if env.status == 1:
+        client.close_env(env_id)
+        time.sleep(2)
+    # 每次启动都是干净新窗口：单页启动、不恢复标签、不开工作台
+    try:
+        client.prepare_fresh_launch(env_id, "about:blank")
+    except Exception as exc:
+        print(f"设定干净启动失败（继续跑）: {type(exc).__name__}: {exc}")
     launch = client.open_env(env_id)
     print(f"已启动 CDP={launch.cdp_http} pid={launch.pid}")
     return launch.cdp_http, client

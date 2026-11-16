@@ -320,6 +320,13 @@ class CDP:
     def close(self) -> None:
         self.ws.close()
 
+    def close_target(self) -> None:
+        """关掉这个页签（否则会留在 profile 里，下次启动被恢复）。"""
+        try:
+            self.call("Page.close", timeout=5)
+        except CDPError:
+            pass
+
     def __enter__(self) -> "CDP":
         return self
 

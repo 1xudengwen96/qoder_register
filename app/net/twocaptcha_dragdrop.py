@@ -78,22 +78,32 @@ class TwoCaptchaDragDrop:
 
         本机实测：本地 Clash 的节点偶发 `SSL: UNEXPECTED_EOF_WHILE_READING`，
         一次失败就抛会让整轮注册白跑，所以这里分「先代理、后直连」两条腿。
+
+        ``trust_env = False``：直连那条腿必须**忽略环境变量里的代理**，
+        否则系统设了 ALL_PROXY=socks5 时会抛
+        ``InvalidSchema: Missing dependencies for SOCKS support``。
         """
         last = ""
-        for attempt in range(retries + 1):
-            for label, px in (("代理", self.proxy), ("直连", None)):
-                if label == "直连" and not self.proxy:
-                    continue
-                proxies = {"http": px, "https": px} if px else None
-                try:
-                    r = requests.post(url, json=payload, proxies=proxies,
-                                      timeout=40)
-                    return r.json()
-                except Exception as exc:
-                    last = f"{label} {type(exc).__name__}: {exc}"
-                    continue
-            if attempt < retries:
-                time.sleep(2.0 * (attempt + 1))
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            for attempt in range(retries + 1):
+                for label, px in (("代理", self.proxy), ("直连", None)):
+                    if label == "直连" and not self.proxy:
+                        continue
+                    proxies = ({"http": px, "https": px} if px
+                               else {"http": "", "https": ""})
+                    try:
+                        r = session.post(url, json=payload, proxies=proxies,
+                                         timeout=40)
+                        return r.json()
+                    except Exception as exc:
+                        last = f"{label} {type(exc).__name__}: {exc}"
+                        continue
+                if attempt < retries:
+                    time.sleep(2.0 * (attempt + 1))
+        finally:
+            session.close()
         raise TwoCaptchaError(f"请求失败（{retries + 1} 轮）: {last}")
 
     def balance(self) -> float:

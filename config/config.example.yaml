@@ -53,7 +53,7 @@ mail:
       imap_id: ""                   # 留空用默认 ID；部分服务端要求登录后发 ID
     # 收码匹配规则（按邮件服务商微调）
     match:
-      sender_allow: ["qoder.com"]           # 发件人包含这些域才算
+      sender_allow: ["qoder"]               # 不含点：iCloud 转发会改写成 no-reply_at_qoder_com_xxx@icloud.com才算
       subject_contains: ["qoder"]           # 主题或正文命中
       code_regex: "\\b(\\d{6})\\b"          # 验证码正则，第一个分组为准
       scan_body_for_recipient: true         # 正文里找隐藏地址（转发链常写进页脚）

@@ -315,6 +315,14 @@ class CDPPage:
         return self.value(selector) == text
 
     # ---------------------------------------------------------- 收尾
+    def close_tab(self) -> None:
+        """关掉自己开的页签，再断连接（避免下次启动被会话恢复带出来）。"""
+        try:
+            self.cdp.close_target()
+        except Exception:
+            pass
+        self.close()
+
     def close(self) -> None:
         self.cdp.close()
 

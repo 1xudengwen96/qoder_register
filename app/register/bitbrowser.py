@@ -478,6 +478,23 @@ class BitBrowserClient:
         except BitBrowserError:
             return False
 
+    # ---------------------------------------------------------- 干净启动
+    def prepare_fresh_launch(self, env_id: str,
+                             startup_url: str = "about:blank") -> dict:
+        """把环境改成「每次启动都是干净新窗口」。三个字段缺一不可：
+
+        - ``url``：原来可能塞了多条（``about:blank,https://qoder.com/``），
+          每次启动全开一遍。固定成一条。
+        - ``syncTabs``：标签同步，会把上次的标签带回来。
+        - ``workbench``：非空时客户端都会打开 ``console.bitbrowser.net``
+          工作台标签；置空后不再打开。
+
+        实测：三项都设好后启动只有一个标签页。
+        """
+        fields = {"url": startup_url, "syncTabs": False, "workbench": ""}
+        self.update_env(env_id, **fields)
+        return fields
+
     # ---------------------------------------------------------- 启动
     def open_env(
         self,
