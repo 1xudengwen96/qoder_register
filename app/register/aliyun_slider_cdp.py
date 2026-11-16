@@ -319,23 +319,16 @@ class AliyunSliderCDP:
                 sol = self.paid.solve(bg, pz_c)
                 if sol.ok:
                     self.total_cost += sol.cost
-                    # 2Captcha 的 x 语义实测有歧义：可能给「拼图块中心」，
-                    # 也可能给「目标左沿」。两种解释交替试。
-                    self._paid_variant = getattr(self, "_paid_variant", 0) + 1
-                    if self._paid_variant % 2 == 1:
-                        x_left = (sol.x - pw / 2.0) * scale
-                        how = "center"
-                    else:
-                        x_left = sol.x * scale
-                        how = "left-edge"
+                    # 实测（2026-11-16 20:18 通过那次）：2Captcha 的 x 是
+                    # **目标左沿**，不是中心。减半宽会偏 25px 左右。
+                    x_left = sol.x * scale
                     limit = max(0.0, disp_w - pw * scale)
                     x_left = min(max(0.0, x_left), limit)
                     dy = abs(sol.y - bbox_y)
-                    self._d(f"2Captcha 中心 x={sol.x:.0f} y={sol.y:.0f} "
-                            f"(bbox_y={bbox_y} dy={dy:.0f}) [{how}] "
-                            f"→ 左沿 {x_left:.1f} 耗时={sol.elapsed:.1f}s "
-                            f"cost=${sol.cost:.4f}")
-                    return x_left, f"2captcha({how},c={sol.x:.0f})", sol.cost
+                    self._d(f"2Captcha x={sol.x:.0f} y={sol.y:.0f} "
+                            f"(bbox_y={bbox_y} dy={dy:.0f}) → 左沿 {x_left:.1f}"
+                            f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}")
+                    return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
                 self._d(f"2Captcha 失败: {sol.error}")
             except Exception as exc:
                 self._d(f"2Captcha 异常: {type(exc).__name__}: {exc}")
@@ -378,6 +371,10 @@ class AliyunSliderCDP:
         track_w = max(track["w"], 1)
         max_travel = max(bg_box["w"] - pz_box.get("w", 52), 1)
         ratio = track_w / max_travel
+        if not (0.2 <= ratio <= 5.0):        # 布局没量到时兜底
+            self._d(f"ratio 异常 {ratio:.2f}（track={track_w} "
+                    f"bg={bg_box.get('w')}），按 1.0 处理")
+            ratio = 1.0
 
         if self.human:
             self.page.move(sx - random.uniform(20, 45), sy + random.uniform(12, 28))
@@ -399,39 +396,24 @@ class AliyunSliderCDP:
                 time.sleep(random.uniform(0.02, 0.05))
 
         cur_x = sx
-        # ---- 开环拖动：有机轨迹（变速 + 停顿 + 轻微过冲回拉）----
+        # ---- 开环拖动（2026-11-16 18:46 实测通过的那版）----
         total = max(-track_w, min(track_w, target_left * ratio))
-        self._d(f"开环拖动 total={total:.1f}px ratio={ratio:.2f}")
-
-        # 按下后先停顿（真人会犹豫）
-        time.sleep(random.uniform(0.25, 0.6))
-
-        overshoot = random.uniform(1.5, 4.0) if abs(total) > 40 else 0.0
-        target_x = sx + total + (overshoot if total > 0 else -overshoot)
-        steps = max(30, int(abs(total) / 1.6))
-        base_dt = random.uniform(0.010, 0.022)
+        duration = random.uniform(1.1, 1.9)
+        steps = max(40, int(abs(total) / 2))
+        pause_at = random.randint(int(steps * 0.55), int(steps * 0.8))
+        self._d(f"开环拖动 total={total:.1f}px steps={steps} "
+                f"dur={duration:.2f}s ratio={ratio:.2f}")
         for i in range(1, steps + 1):
             t = i / steps
             eased = t * t * (3 - 2 * t)
-            x = sx + (target_x - sx) * eased
+            x = sx + total * eased
             if self.human:
-                x += random.uniform(-0.5, 0.5)
+                x += random.uniform(-0.35, 0.35)
             cur_x = x
-            self.page.move(cur_x, sy + random.uniform(-0.5, 0.5), buttons=1)
-            # 变速：偶尔快、偶尔慢、偶尔停一帧
-            dt = base_dt * random.choice((0.5, 0.8, 1.0, 1.0, 1.4, 2.2))
-            time.sleep(dt)
-            if random.random() < 0.06:
-                time.sleep(random.uniform(0.03, 0.09))
-
-        # 回拉到目标位（过冲修正）
-        if overshoot:
-            pull_steps = random.randint(3, 6)
-            for i in range(1, pull_steps + 1):
-                x = target_x - (overshoot if total > 0 else -overshoot) * i / pull_steps
-                cur_x = x
-                self.page.move(cur_x, sy + random.uniform(-0.3, 0.3), buttons=1)
-                time.sleep(random.uniform(0.02, 0.05))
+            self.page.move(cur_x, sy + random.uniform(-0.4, 0.4), buttons=1)
+            time.sleep(duration / steps * random.uniform(0.75, 1.25))
+            if i == pause_at:
+                time.sleep(random.uniform(0.08, 0.16))
 
         # ---- 闭环修正：只有 style.left 真的在变时才用（新版本可能不写它）----
         for _ in range(24):
@@ -486,7 +468,7 @@ class AliyunSliderCDP:
             if not self.page.wait_js(JS_ARMED, timeout=1):
                 self.heal_images(bg0, pz0)
 
-            ident = self.identify(got, prefer_local=(attempt % 2 == 0))
+            ident = self.identify(got)   # 付费优先，本地仅兜底
             if ident is None:
                 res.detail = "识别失败"
                 self.refresh()

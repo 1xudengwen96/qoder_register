@@ -397,6 +397,44 @@ class QoderSignupCDP:
                                 "url": url[:140]})
         return out[-limit:]
 
+    # 强制触发 AntD OTP 的完成回调：直接以「字符串」调 onChange
+    JS_OTP_FORCE = r"""(() => {
+  const e = document.querySelector(
+    "input[autocomplete='one-time-code'], input[maxlength='6']");
+  if (!e) return 'no-input';
+  const code = e.value || '';
+  const out = {code, fired: [], err: ''};
+  const call = (obj, name, arg) => {
+    try {
+      if (obj && typeof obj[name] === 'function') {
+        obj[name](arg);
+        out.fired.push(name);
+      }
+    } catch (ex) { out.err += name + ':' + String(ex).slice(0, 40) + ';'; }
+  };
+  const keyOf = (el) => el && Object.keys(el).find(k => k.startsWith('__reactProps$'));
+  const props = e[keyOf(e)];
+  // AntD Input.OTP 的 onChange 形参是字符串
+  call(props, 'onChange', code);
+  call(props, 'onInput', {target: e, currentTarget: e});
+  const pk = keyOf(e.parentElement);
+  if (pk) {
+    const pp = e.parentElement[pk];
+    call(pp, 'onChange', code);
+  }
+  // 再补一次原生事件链
+  try {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value').set;
+    setter.call(e, code);
+    e.dispatchEvent(new InputEvent('input', {bubbles: true,
+        inputType: 'insertText', data: code}));
+    e.dispatchEvent(new Event('change', {bubbles: true}));
+    out.fired.push('native');
+  } catch (ex) { out.err += 'native:' + String(ex).slice(0, 40); }
+  return JSON.stringify(out);
+})()"""
+
     def _otp_selector(self) -> str:
         for sel in OTP_SELECTORS:
             if self.page.exists(sel):
@@ -474,7 +512,17 @@ class QoderSignupCDP:
         otp_wait = self.page.wait_js(
             "(() => !!document.querySelector("
             "\"input[autocomplete='one-time-code'], input[maxlength='6']\"))()",
-            timeout=40)
+            timeout=25)
+        if not otp_wait:
+            # 实测：滑块过了页面会停在「Verified」，需要再点一次 Continue 才进 OTP
+            self._d("OTP 未出现，补点一次提交")
+            clicked = self._click_submit()
+            if clicked:
+                self._d(f"补点: {clicked}")
+            otp_wait = self.page.wait_js(
+                "(() => !!document.querySelector("
+                "\"input[autocomplete='one-time-code'], input[maxlength='6']\"))()",
+                timeout=20)
         if not otp_wait:
             body = self.page.text()[:200].replace("\n", " | ")
             self._shot("no_otp_input")
@@ -540,6 +588,17 @@ class QoderSignupCDP:
                 moved, state = self._otp_progressed(before_url, before)
                 if moved:
                     break
+
+        # ③.5 直接以「字符串」调 React 的 onChange（AntD OTP 的形参是字符串）
+        if not moved:
+            try:
+                out = self.page.eval(self.JS_OTP_FORCE)
+                ladder.append("force")
+                self._d(f"force 注入: {out}")
+                self._sleep(2.0, 2.8)
+                moved, state = self._otp_progressed(before_url, before)
+            except Exception as exc:  # noqa: BLE001
+                self._d(f"force 失败: {type(exc).__name__}: {exc}")
 
         # ④ 表单级 submit
         if not moved:
