@@ -17,8 +17,8 @@ from app.net.captcha_solver import (
     CaptchaResult,
     CaptchaSolver,
     CaptchaTask,
-    LocalOCR,
     Provider,
+    TwoCaptcha,
 )
 
 TMP_ROOT = Path(__file__).resolve().parent / "_tmp"
@@ -137,33 +137,37 @@ class _AlwaysOk(Provider):
 
 
 class TestCaptchaSolver(unittest.TestCase):
-    def test_fallback_to_next_provider(self):
-        solver = CaptchaSolver([_AlwaysFail(), _AlwaysOk()],
-                               prefer={"image": ["fail", "ok"]})
+    """打码只走 2Captcha：单供应商路由、失败抛错、计费累计。"""
+
+    def test_single_provider_solve(self):
+        solver = CaptchaSolver([_AlwaysOk()])
         res = solver.solve(CaptchaTask(kind="image", image_b64="xx"))
         self.assertEqual(res.token, "TOKEN_OK")
         self.assertAlmostEqual(solver.spent, 0.002)
         self.assertEqual(solver.solved, 1)
 
-    def test_all_fail_raises(self):
+    def test_fail_raises_and_counts(self):
         from app.net.captcha_solver import CaptchaError
-        solver = CaptchaSolver([_AlwaysFail()], prefer={"image": ["fail"]})
+        solver = CaptchaSolver([_AlwaysFail()])
         with self.assertRaises(CaptchaError):
             solver.solve(CaptchaTask(kind="image", image_b64="xx"))
         self.assertEqual(solver.failed, 1)
 
-    def test_unconfigured_kind_skipped(self):
+    def test_no_provider_raises(self):
         from app.net.captcha_solver import CaptchaError
-        solver = CaptchaSolver([_AlwaysOk()], prefer={"turnstile": ["ok"]})
-        self.assertEqual(solver.solve(CaptchaTask(kind="turnstile")).token, "TOKEN_OK")
+        solver = CaptchaSolver([])
+        with self.assertRaises(CaptchaError):
+            solver.solve(CaptchaTask(kind="image", image_b64="xx"))
 
-    def test_local_ocr_only_image(self):
-        p = LocalOCR()
-        self.assertTrue(p.supports("image"))
-        self.assertFalse(p.supports("recaptcha_v2"))
+    def test_twocaptcha_supports_five_kinds(self):
+        p = TwoCaptcha("k")
+        self.assertFalse(p.supports("image_unknown"))
+        for kind in ("recaptcha_v2", "recaptcha_v3", "hcaptcha",
+                     "turnstile", "image"):
+            self.assertTrue(p.supports(kind), kind)
 
     def test_cost_summary(self):
-        solver = CaptchaSolver([_AlwaysOk()], prefer={"image": ["ok"]})
+        solver = CaptchaSolver([_AlwaysOk()])
         solver.solve(CaptchaTask(kind="image"))
         self.assertIn("打码成功 1 次", solver.cost_summary())
 

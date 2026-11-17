@@ -1,15 +1,11 @@
-"""阿里云滑块求解器（付费优先版）。
+"""阿里云滑块求解器（Playwright 版，只用 2Captcha）。
 
 策略
 ----
-**主用 2Captcha DragAndDropTask**（$0.0012/次，15~20 秒）
+**只走 2Captcha DragAndDropTask**（$0.0012/次，15~20 秒）
     - 只提交背景图 + 拼图块，返回缺口坐标
     - 与拖拽逻辑完全解耦，替换成本极低
-    - 用户明确要求「不自研」，这是主路径
-
-**本地 OpenCV 作为可选降级**（免费但稳定性不足）
-    - 实测会退化（多峰等高）、且换题后 src 变化导致失败
-    - 仅在 ``prefer_paid=False`` 时使用
+    - 2026-11-17 起：自研本地识别已全部移除，这是唯一路径
 
 踩坑记录
 --------
@@ -253,41 +249,37 @@ class AliyunSliderSolver:
         pw = pz_c.size[0]
         bbox_y = bbox[1]          # 缺口在该画布里的 y
 
-        # ---- 付费优先 ----
-        if self.prefer_paid:
-            try:
-                sol = self.paid.solve(bg, pz_c)
-                if sol.ok:
-                    self.total_cost += sol.cost
-                    # 2Captcha 返回的是**拼图块中心**的目标 x，减半宽得左沿。
-                    # 实测对照（拼图宽 52）：
-                    #   271 → 245 拖到 248 通过；274 → 248 拖到 247 通过
-                    #   196 → 170.5 通过；181 → 155.5 通过
-                    #   179 → 153 失败；242 → 216.5 失败
-                    half = pw / 2.0
-                    x_left = sol.x - half
-                    x_left = min(max(0.0, x_left), float(bg_w - pw))
+        # ---- 2Captcha（唯一识别来源，失败直接放弃本轮） ----
+        if not self.prefer_paid:
+            self._d("没有 2Captcha 客户端（本地识别已移除）")
+            return None
+        try:
+            sol = self.paid.solve(bg, pz_c)
+            if sol.ok:
+                self.total_cost += sol.cost
+                # 2Captcha 返回的是**拼图块中心**的目标 x，减半宽得左沿。
+                # 实测对照（拼图宽 52）：
+                #   271 → 245 拖到 248 通过；274 → 248 拖到 247 通过
+                #   196 → 170.5 通过；181 → 155.5 通过
+                #   179 → 153 失败；242 → 216.5 失败
+                half = pw / 2.0
+                x_left = sol.x - half
+                x_left = min(max(0.0, x_left), float(bg_w - pw))
 
-                    dy = abs(sol.y - bbox_y)
-                    if dy > 35:
-                        # y 偏差过大 → 判定识别不可信，换题重试
-                        self._d(f"2Captcha y={sol.y} 与 bbox_y={bbox_y} "
-                                f"偏差 {dy:.0f}px 过大，判为不可信")
-                        return None
+                dy = abs(sol.y - bbox_y)
+                if dy > 35:
+                    # y 偏差过大 → 判定识别不可信，换题重试
+                    self._d(f"2Captcha y={sol.y} 与 bbox_y={bbox_y} "
+                            f"偏差 {dy:.0f}px 过大，判为不可信")
+                    return None
 
-                    self._d(f"2Captcha 中心 x={sol.x} y={sol.y}(bbox_y={bbox_y}) "
-                            f"→ 左沿 {x_left} 耗时={sol.elapsed:.1f}s "
-                            f"cost=${sol.cost:.4f}")
-                    return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
-                self._d(f"2Captcha 失败: {sol.error}")
-            except Exception as exc:
-                self._d(f"2Captcha 异常: {type(exc).__name__}: {exc}")
-
-        # ---- 本地兜底 ----
-        gap = captcha_vision.find_gap(bg, pz, display_w=None)
-        if gap.ok:
-            return gap.x_display, f"local-{gap.method}", 0.0
-        self._d(f"本地识别失败: {gap.detail}")
+                self._d(f"2Captcha 中心 x={sol.x} y={sol.y}(bbox_y={bbox_y}) "
+                        f"→ 左沿 {x_left} 耗时={sol.elapsed:.1f}s "
+                        f"cost=${sol.cost:.4f}")
+                return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
+            self._d(f"2Captcha 失败: {sol.error}")
+        except Exception as exc:
+            self._d(f"2Captcha 异常: {type(exc).__name__}: {exc}")
         return None
 
     # ---------------------------------------------------------- 拖拽

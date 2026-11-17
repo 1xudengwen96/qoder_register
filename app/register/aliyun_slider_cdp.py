@@ -2,7 +2,8 @@
 
 逻辑与 ``app/register/aliyun_slider.py`` 等价，只是把 ``page.evaluate``
 换成 ``CDPPage.eval``，把 Playwright 的鼠标换成 ``Input.dispatchMouseEvent``。
-识别仍用 ``captcha_vision.find_gap``（numpy 版），可选 2Captcha 付费兜底。
+识别只用 2Captcha（2026-11-17 起：自研本地识别已全部移除）。
+``captcha_vision`` 仅用于取图/解码/裁剪（2Captcha 的输入预处理）。
 
 实测要点（沿用旧版结论，全部仍然成立）
 ------------------------------------
@@ -10,7 +11,11 @@
 2. 拼图块必须裁到 alpha bbox（52×200 画布 81% 是透明）
 3. refresh 换题后 src 会变成 ``*.aliyuncs.com`` 远程 URL
 4. 拖动必须实时读 ``#aliyunCaptcha-puzzle`` 的 ``style.left`` 做残差修正
-5. 轨道宽度与图像可移动距离之间有比例，不能直接按像素搬
+5. 拖拽映射不是常数比例：拼图位移 = g(滑块位移) 是加速曲线（见
+   ``_DRAG_A/_DRAG_B``，2026-11-17 受控实验标定），开环必须按曲线逆变换
+   估算行程，闭环必须低增益小步长（无瞬移）收敛
+6. 2Captcha 返回的 x/y 是拼图缺口的**中心**坐标（不是左沿/顶沿），
+   2026-11-17 七组独立采样证实（详见 identify 的 docstring）
 """
 
 from __future__ import annotations
@@ -80,8 +85,16 @@ JS_SOLVED = """(() => {
   if (codeInput && codeInput.getBoundingClientRect().width > 0) {
     return {ok: true, why: 'code-input-appeared'};
   }
+  // 组件 class 是代码控制、与页面语言无关（2026-11-17 acct22 实测：
+  // 中文页“验证通过”英文文本匹配漏检 → 空转 7 分钟；class=verified 则稳定）
+  const cb = document.getElementById('aliyunCaptcha-captcha-body');
+  if (cb && /(^|\s)verified(\s|$)/.test(String(cb.className))) {
+    return {ok: true, why: 'cls-verified'};
+  }
   const txt = (document.body ? document.body.innerText : '').toLowerCase();
-  if (txt.includes('verified') && !txt.includes('unable to verify')) {
+  if ((txt.includes('verified') || txt.includes('验证通过') ||
+       txt.includes('驗證通過')) &&
+      !txt.includes('unable to verify')) {
     return {ok: true, why: 'text-verified'};
   }
   const err = document.querySelector('[class*=error],[class*=tips-error]');
@@ -89,7 +102,8 @@ JS_SOLVED = """(() => {
     return {ok: false, why: 'error:' + err.innerText.slice(0, 60)};
   }
   if (txt.includes('please complete the captcha') ||
-      txt.includes('unable to verify')) {
+      txt.includes('unable to verify') ||
+      txt.includes('请完成人机验证') || txt.includes('請完成人機驗證')) {
     return {ok: false, why: 'still-need-captcha'};
   }
   const win = document.querySelector('#aliyunCaptcha-window-float');
@@ -169,6 +183,25 @@ def _img_to_data_url(img) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+# ---- 拖拽行程映射（2026-11-17 受控实验标定，qoder.com 注册页几何）----
+# 滑块位移 t → 拼图 style.left = g(t) = a·t + b·t²，纯空间映射：
+# 跳变与慢拖同值、按住零漂移（与速度/时间无关）。g(260)=260 恰与轨道
+# 端点对齐。旧代码按常数 ratio = track/(bg-pz) = 1.21 开环，远端过冲
+# 可达 +40px；闭环 dx=remaining×1.21 在末端实际斜率 ≈1.9 处是超增益，
+# 振荡后停在 target+6~8px（与生产日志逐位吻合）。
+_DRAG_A, _DRAG_B = 0.077, 0.00355
+
+
+def travel_for_target(target_left: float) -> float:
+    """g(t) = a·t + b·t² 的逆变换：目标 left → 滑块行程 t（显示像素）。"""
+    if target_left <= 0:
+        return 0.0
+    disc = _DRAG_A * _DRAG_A + 4 * _DRAG_B * target_left
+    if disc <= 0:
+        return 0.0
+    return (-_DRAG_A + disc ** 0.5) / (2 * _DRAG_B)
+
+
 @dataclass(slots=True)
 class SolveResult:
     ok: bool
@@ -184,15 +217,12 @@ class SolveResult:
 class AliyunSliderCDP:
     def __init__(self, page, *, human: bool = True, logger=None,
                  paid_client=None, prefer_paid: bool = False,
-                 proxy: str | None = None,
-                 local_fallback: bool = True) -> None:
+                 proxy: str | None = None) -> None:
         self.page = page
         self.human = human
         self.log = logger
         self.paid = paid_client
-        self.prefer_paid = prefer_paid and paid_client is not None
-        # 付费可用时默认不回落本地识别（用户要求只走 2Captcha）
-        self.local_fallback = local_fallback and not self.prefer_paid
+        self.paid_ready = paid_client is not None
         self.proxy = proxy
         self.total_cost = 0.0
 
@@ -295,7 +325,21 @@ class AliyunSliderCDP:
         return None
 
     # ---------------------------------------------------------- 识别
-    def identify(self, got=None, prefer_local: bool = False):
+    def identify(self, got=None):
+        """只走 2Captcha。返回 (target_left, method, cost) 或 None。
+
+        2026-11-17 七组独立采样证实：2Captcha 的 x/y 是拼图缺口的**中心**
+        坐标（自然像素），不是左沿/顶沿：
+        - y 证据：每题 sol.y - pz alpha bbox_y ≈ 半高 26（25/26/27/32）；
+        - x 证据：边缘梯度法测得一题缺口左沿 190/右沿 230，中心 = 210，
+          与 2Captcha x=214 差 4px；另一题左沿 188.4、中心 213.9，
+          与 x=214 一位不差。
+        旧版把 x 当左沿直接换算，每轮恒偏 +25.5×scale px（2026-11-17
+        run:one 十连败主因），左沿 = (x - 拼图半宽) × scale。
+        """
+        if not self.paid_ready:
+            self._d("没有 2Captcha 客户端（识别只走 2Captcha，本地识别已移除）")
+            return None
         if got is None:
             got = self.grab_images()
         if got is None:
@@ -312,41 +356,30 @@ class AliyunSliderCDP:
         self._d(f"图宽 {bg_w} 显示宽 {disp_w:.0f} scale={scale:.3f} "
                 f"拼图 {pw}x{pz_c.size[1]}")
 
-        def _paid():
-            if not self.prefer_paid:
-                return None
+        # 识别请求偶尔出错（图太大/超时/服务波动），最多重试 3 次
+        for try_i in range(1, 4):
             try:
                 sol = self.paid.solve(bg, pz_c)
+            except Exception as exc:
+                self._d(f"2Captcha 异常（第 {try_i}/3）: "
+                        f"{type(exc).__name__}: {exc}")
+            else:
                 if sol.ok:
                     self.total_cost += sol.cost
-                    # 实测（2026-11-16 20:18 通过那次）：2Captcha 的 x 是
-                    # **目标左沿**，不是中心。减半宽会偏 25px 左右。
-                    x_left = sol.x * scale
+                    # x/y 是缺口中心（自然像素）：减拼图半宽得左沿，再乘 scale
+                    x_left = (sol.x - pw / 2) * scale
                     limit = max(0.0, disp_w - pw * scale)
                     x_left = min(max(0.0, x_left), limit)
-                    dy = abs(sol.y - bbox_y)
+                    dy = sol.y - bbox_y
                     self._d(f"2Captcha x={sol.x:.0f} y={sol.y:.0f} "
-                            f"(bbox_y={bbox_y} dy={dy:.0f}) → 左沿 {x_left:.1f}"
-                            f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}")
+                            f"(bbox_y={bbox_y} dy={dy:.0f}≈半高"
+                            f"{pz_c.size[1] // 2}→中心) → 左沿 {x_left:.1f}"
+                            f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}"
+                            f"{' 重试' + str(try_i - 1) if try_i > 1 else ''}")
                     return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
-                self._d(f"2Captcha 失败: {sol.error}")
-            except Exception as exc:
-                self._d(f"2Captcha 异常: {type(exc).__name__}: {exc}")
-            return None
-
-        def _local():
-            gap = captcha_vision.find_gap(bg, pz, display_w=disp_w)
-            if gap.ok:
-                return gap.x_display, f"local-{gap.method}", 0.0
-            self._d(f"本地识别失败: {gap.detail}")
-            return None
-
-        # 两个来源实测会差 40px 左右，交替优先，命中率更高
-        order = (_local, _paid) if prefer_local else (_paid, _local)
-        for fn in order:
-            ident = fn()
-            if ident:
-                return ident
+                self._d(f"2Captcha 失败（第 {try_i}/3）: {sol.error}")
+            if try_i < 3:
+                time.sleep(1.5)
         return None
 
     # ---------------------------------------------------------- 拖拽
@@ -395,43 +428,56 @@ class AliyunSliderCDP:
                                sy + random.uniform(-1.5, 1.5), buttons=1)
                 time.sleep(random.uniform(0.02, 0.05))
 
+        # ---- 行程初值：加速曲线逆变换（受控实验标定，见模块头 _DRAG_A/B）----
+        travel_cap = max(track_w - slider["w"], 1)   # 滑块自身宽度不能出轨道
+        t0 = max(0.0, min(travel_for_target(target_left), travel_cap))
+        self._d(f"拖动：目标 {target_left:.1f} → 行程初值 {t0:.1f}"
+                f"（曲线逆变换，max_travel={travel_cap:.0f}）")
+
+        # ---- 单程缓动（拟人，无瞬移）：1.4~2.0s 滑到行程初值 ----
         cur_x = sx
-        # ---- 开环拖动（2026-11-16 18:46 实测通过的那版）----
-        total = max(-track_w, min(track_w, target_left * ratio))
-        duration = random.uniform(1.1, 1.9)
-        steps = max(40, int(abs(total) / 2))
-        pause_at = random.randint(int(steps * 0.55), int(steps * 0.8))
-        self._d(f"开环拖动 total={total:.1f}px steps={steps} "
-                f"dur={duration:.2f}s ratio={ratio:.2f}")
+        duration = random.uniform(1.4, 2.0)
+        steps = max(60, int(t0))
+        pause_at = random.randint(int(steps * 0.55), int(steps * 0.75))
         for i in range(1, steps + 1):
             t = i / steps
             eased = t * t * (3 - 2 * t)
-            x = sx + total * eased
+            x = sx + t0 * eased
             if self.human:
-                x += random.uniform(-0.35, 0.35)
+                x += random.uniform(-0.45, 0.45)
             cur_x = x
-            self.page.move(cur_x, sy + random.uniform(-0.4, 0.4), buttons=1)
-            time.sleep(duration / steps * random.uniform(0.75, 1.25))
+            self.page.move(cur_x, sy + random.uniform(-0.5, 0.5), buttons=1)
+            time.sleep(duration / steps * random.uniform(0.7, 1.3))
             if i == pause_at:
-                time.sleep(random.uniform(0.08, 0.16))
+                time.sleep(random.uniform(0.06, 0.14))
+        time.sleep(random.uniform(0.12, 0.2))
 
-        # ---- 闭环修正：只有 style.left 真的在变时才用（新版本可能不写它）----
-        for _ in range(24):
+        # ---- 微步闭环（无瞬移）：低增益 + ≤3px 小步拆 0.4px 子步 ----
+        # 旧版 dx=remaining×1.21 在末端实际斜率 ≈1.9 处超增益振荡，停在
+        # target+6~8px；实测低增益小步可收敛到 ±1px（跳变/慢拖同值证明
+        # 映射纯空间、无时间平滑，闭环每步立即生效，无需等稳定）。
+        feedback = False
+        for _ in range(30):
             cur_left = float(self.page.eval(JS_PZ_LEFT) or 0.0)
             if cur_left <= 0.5:
-                break                      # 反馈不可用，跳过
+                break                      # 反馈不可用（新版本可能不写它）
+            feedback = True
             remaining = target_left - cur_left
-            if abs(remaining) <= 1.5:
+            if abs(remaining) <= 1.0:
                 break
-            dx = max(-8.0, min(8.0, remaining * ratio))
+            dx = max(-3.0, min(3.0, remaining * 0.7))
+            nsub = max(2, int(abs(dx) / 0.4))
+            for j in range(1, nsub + 1):
+                self.page.move(cur_x + dx * j / nsub,
+                               sy + random.uniform(-0.5, 0.5), buttons=1)
+                time.sleep(random.uniform(0.012, 0.02))
             cur_x = max(track["x"], min(track["x"] + track_w, cur_x + dx))
-            self.page.move(cur_x, sy + random.uniform(-0.5, 0.5), buttons=1)
-            time.sleep(random.uniform(0.02, 0.04))
+            time.sleep(random.uniform(0.03, 0.06))
 
         final = float(self.page.eval(JS_PZ_LEFT) or 0.0)
         moved = final if final > 0.5 else (cur_x - sx) / max(ratio, 1e-6)
         self._d(f"拖动完成 left={final:.1f} 估计位移={moved:.1f} "
-                f"target={target_left:.1f}")
+                f"target={target_left:.1f} 反馈={feedback}")
         if self.human:
             time.sleep(random.uniform(0.35, 0.6))     # 松手前停一下
         self.page.mouse("mouseReleased", cur_x, sy, buttons=0)
@@ -452,11 +498,38 @@ class AliyunSliderCDP:
     # ---------------------------------------------------------- 主流程
     def solve(self, max_attempts: int = 6) -> SolveResult:
         res = SolveResult(ok=False)
+        expand_fails = 0
         for attempt in range(1, max_attempts + 1):
             res.attempts = attempt
+            # 先看是否已通过：refresh 换题/点展开按钮都可能触发阿里云的
+            # **无感通过**（环境可信直接放行，组件收起、窗口永不展开），
+            # 2026-11-17 acct20 实测：expand 空转 15 分钟而页面早已 Verified。
+            st = self.check()
+            if st.get("ok") and "weak" not in str(st.get("why")):
+                res.ok = True
+                res.detail = str(st.get("why"))
+                self._d(f"滑块已通过（循环开头检测 {st.get('why')}）")
+                return res
             if not self.expand():
+                # 窗口起不来≠锁定：很可能就是“已通过收起”。再查一次
+                st = self.check()
+                if st.get("ok") and "weak" not in str(st.get("why")):
+                    res.ok = True
+                    res.detail = str(st.get("why"))
+                    self._d(f"滑块通过（expand 失败后发现 {st.get('why')}）")
+                    return res
+                expand_fails += 1
+                if expand_fails >= 2:
+                    # 止损：明确拒绝（错误条）后 refresh 常把组件锁死
+                    #（img display:none/滑块 pe:none，怎么点都起不来），
+                    # 空转 6 轮纯烧时间。快退出，让上层 Go back 恢复重走。
+                    # 2026-11-17 acct22 实测：锁定后空转 7 分钟无进展。
+                    res.detail = "expand-lock"
+                    self._d("滑块窗口连续 2 次起不来，止损退出")
+                    break
                 time.sleep(2)
                 continue
+            expand_fails = 0
 
             got = self.grab_images()
             if got is None:
@@ -468,7 +541,7 @@ class AliyunSliderCDP:
             if not self.page.wait_js(JS_ARMED, timeout=1):
                 self.heal_images(bg0, pz0)
 
-            ident = self.identify(got)   # 付费优先，本地仅兜底
+            ident = self.identify(got)   # 只走 2Captcha
             if ident is None:
                 res.detail = "识别失败"
                 self.refresh()
@@ -493,6 +566,23 @@ class AliyunSliderCDP:
                 self._d(f"滑块通过（第 {attempt} 次 target={target:.1f} "
                         f"method={method}）")
                 return res
+
+            # 判定延迟容忍：still-need-captcha 只是“还没判完”，不是判负。
+            # 2026-11-17 acct21 实测：拖后 4s 内 still-need-captcha，实际通过
+            # （判定 >4s 才回来）；过早点 refresh 会打断 success 回调，死在
+            # 「Verified|Go back」假通过页（无 button 无 form）。所以先延长复查。
+            if "still-need-captcha" in str(st.get("why")):
+                for _ in range(4):           # 再等最多 12s
+                    time.sleep(3)
+                    st = self.check()
+                    if st.get("ok") and "weak" not in str(st.get("why")):
+                        res.ok = True
+                        res.detail = str(st.get("why"))
+                        self._d(f"滑块通过（延迟判定，第 {attempt} 次 "
+                                f"target={target:.1f}）")
+                        return res
+                    if "still-need-captcha" not in str(st.get("why")):
+                        break              # 出现明确错误条，走正常换题
 
             res.detail = str(st.get("why"))
             self._d(f"第 {attempt} 次未通过: {res.detail} "

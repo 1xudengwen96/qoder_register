@@ -6,7 +6,7 @@ wheel，再用 zipfile 解压到目标目录，等价于 pip install --target。
 
 用法：
     python tools/bootstrap_deps.py --target .pylibs
-    python tools/bootstrap_deps.py --target .pylibs --with playwright ddddocr
+    python tools/bootstrap_deps.py --target .pylibs --with playwright
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ BASE_DEPS = [
     "sqlalchemy", "pyyaml", "requests",
 ]
 
-OPTIONAL_DEPS = ["playwright", "ddddocr", "pywinauto"]
+OPTIONAL_DEPS = ["playwright", "pywinauto"]
 
 
 def pick_wheel(info: dict, py_ver: tuple[int, int], plat_tags: list[str]) -> dict | None:

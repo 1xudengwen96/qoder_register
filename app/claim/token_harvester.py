@@ -57,10 +57,56 @@ from pathlib import Path
 
 
 # ============================================================ 路径
+def _user_data_dir_from_process() -> str | None:
+    """从正在运行的 Qoder.exe 进程命令行读 --user-data-dir，最可靠。
+
+    Qoder 0.4.x 起，Electron 主进程会带 ``--user-data-dir=%APPDATA%\\com.qoder.app.stable``，
+    这才是真正写 token / DevToolsActivePort 的目录。旧代码写死 ``%APPDATA%\\Qoder``，
+    在新版本上永远是空目录。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='Qoder.exe'\" | "
+             "Select-Object -ExpandProperty CommandLine"],
+            capture_output=True, timeout=8, text=True, errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if "--user-data-dir=" in line:
+            rest = line.split("--user-data-dir=", 1)[1].strip()
+            if rest.startswith('"'):
+                rest = rest.split('"', 2)[1]
+            else:
+                rest = rest.split()[0]
+            if rest:
+                return rest
+    return None
+
+
 def qoder_data_dir() -> Path:
-    """Qoder 数据目录（Windows 是 Roaming，不是 Local）。"""
+    """Qoder 数据目录。
+
+    优先级：从运行中的 Qoder.exe ``--user-data-dir`` 推断 → ``com.qoder.app.stable``
+    （0.4.x 默认）→ ``Qoder``（0.3.x 旧布局，向后兼容）。
+    """
     if os.name == "nt":
-        return Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / "Qoder"
+        from_env = _user_data_dir_from_process()
+        if from_env and Path(from_env).exists():
+            return Path(from_env)
+        appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
+        # 0.4.x+ 默认数据目录
+        stable = appdata / "com.qoder.app.stable"
+        if stable.exists():
+            return stable
+        # 旧版本布局，向后兼容
+        return appdata / "Qoder"
     home = Path.home()
     if os.uname().sysname == "Darwin":  # type: ignore[attr-defined]
         return home / "Library" / "Application Support" / "Qoder"
@@ -136,7 +182,11 @@ class QoderTokenHarvester:
 
     # ---------------------------------------------------------- 1. 主路径
     def harvest_from_file(self) -> QoderToken | None:
-        """读 ``machine_token.json``。实测明文，不需要解密。"""
+        """读 ``machine_token.json``。实测明文，不需要解密。
+
+        0.4.x 客户端不在 ``SharedClientCache/cache/`` 下放这个文件了，
+        这条路径只对 0.3.x 及更早版本有效；0.4.x 走 ``harvest_from_safe_storage``。
+        """
         p = self.data_dir / self.TOKEN_FILE
         if not p.exists():
             return None
@@ -157,6 +207,108 @@ class QoderTokenHarvester:
             version=str(data.get("version", "")),
             update_at=int(data.get("updateAt", 0) or 0),
             source="machine_token",
+            raw=data,
+        )
+
+    # ---------------------------------------------------------- 1b. safeStorage
+    def harvest_from_safe_storage(self) -> QoderToken | None:
+        """0.4.x 起 Qoder 把 token 存在 ``auth.v1.dat`` 里，用 Electron
+        safeStorage（Windows = DPAPI 包 AES-256-GCM）加密。
+
+        解密流程：
+
+        1. ``Local State`` 的 ``os_crypt.encrypted_key`` = base64( ``b"DPAPI"``
+           + DPAPI_encrypt(AES_KEY) )
+        2. DPAPI 解出 32 字节 AES key
+        3. ``auth.v1.dat`` = ``b"v10"`` + nonce(12) + ciphertext + tag(16)，
+           AES-256-GCM 解密得到明文 JSON::
+
+               {"schemaVersion":1, "token":"dt-...", "refreshToken":"drt-...",
+                "expiresAt":"2026-...", "user":{...}}
+
+        需要本机用户 session（DPAPI 绑定用户）。没有 ``cryptography`` 库时
+        自动回落到系统 BCrypt。
+        """
+        if os.name != "nt":
+            return None
+        auth = self.data_dir / "auth.v1.dat"
+        local_state = self.data_dir / "Local State"
+        if not auth.exists() or not local_state.exists():
+            return None
+
+        import base64
+        try:
+            import ctypes
+
+            class _DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_ulong),
+                            ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            def _dpapi(data: bytes) -> bytes:
+                inb = _DATA_BLOB(len(data),
+                                 ctypes.cast(ctypes.c_char_p(data),
+                                             ctypes.POINTER(ctypes.c_char)))
+                outb = _DATA_BLOB()
+                if not ctypes.windll.crypt32.CryptUnprotectData(  # type: ignore[attr-defined]
+                        ctypes.byref(inb), None, None, None, None, 0,
+                        ctypes.byref(outb)):
+                    return b""
+                out = ctypes.string_at(outb.pbData, outb.cbData)
+                ctypes.windll.kernel32.LocalFree(outb.pbData)  # type: ignore[attr-defined]
+                return out
+        except Exception:
+            return None
+
+        try:
+            ls = json.loads(local_state.read_text(encoding="utf-8"))
+            enc = base64.b64decode(ls["os_crypt"]["encrypted_key"])
+            if enc[:5] != b"DPAPI":
+                return None
+            key = _dpapi(enc[5:])
+            if len(key) != 32:
+                return None
+        except Exception:
+            return None
+
+        blob = auth.read_bytes()
+        if blob[:3] != b"v10":
+            return None
+        payload = blob[3:]
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            # payload = nonce(12) + ciphertext + tag(16)：密文必须切掉头部
+            # nonce 再传，否则 GCM 校验必然 InvalidTag
+            plain = AESGCM(key).decrypt(payload[:12], payload[12:], None)
+        except ImportError:
+            plain = _bcrypt_gcm(key, payload)
+        except Exception:
+            return None
+        if not plain:
+            return None
+        try:
+            data = json.loads(plain)
+        except Exception:
+            return None
+        tok = data.get("token")
+        if not tok:
+            return None
+        # expiresAt 是 ISO 字符串，转成 updateAt 风格的毫秒时间戳
+        upd = 0
+        exp = str(data.get("expiresAt", ""))
+        if exp:
+            from datetime import datetime
+            try:
+                upd = int(datetime.fromisoformat(
+                    exp.replace("Z", "+00:00")).timestamp() * 1000)
+            except Exception:
+                upd = 0
+        return QoderToken(
+            token=tok,
+            device_id=str(data.get("user", {}).get("id", "") if isinstance(
+                data.get("user"), dict) else ""),
+            token_type="dt",
+            source="safe_storage",
+            update_at=upd,
             raw=data,
         )
 
@@ -258,8 +410,8 @@ class QoderTokenHarvester:
     def harvest(self, prefer_fresh: bool = True) -> QoderToken | None:
         """按可靠性依次尝试。"""
         candidates: list[QoderToken] = []
-        for fn in (self.harvest_from_file, self.harvest_from_cdp,
-                   self.harvest_from_leveldb):
+        for fn in (self.harvest_from_file, self.harvest_from_safe_storage,
+                   self.harvest_from_cdp, self.harvest_from_leveldb):
             try:
                 t = fn()
             except Exception:
@@ -272,30 +424,36 @@ class QoderTokenHarvester:
             fresh = [c for c in candidates if c.is_fresh()]
             if fresh:
                 candidates = fresh
-        # 明文文件优先，其次 CDP
-        order = {"machine_token": 0, "cdp": 1, "leveldb": 2}
+        # 明文文件优先，其次 safe_storage，再次 CDP，最后 leveldb
+        order = {"machine_token": 0, "safe_storage": 1, "cdp": 2, "leveldb": 3}
         candidates.sort(key=lambda c: order.get(c.source, 9))
         return candidates[0]
 
     # ---------------------------------------------------------- 设备信息
     def read_machine_id(self) -> str:
-        p = self.data_dir / self.MACHINE_ID_FILE
-        try:
-            return p.read_text(encoding="utf-8").strip() if p.exists() else ""
-        except Exception:
-            return ""
+        # 0.4.x 写在 auth.machine-id，0.3.x 写在 machineid
+        for name in ("auth.machine-id", "machineid"):
+            p = self.data_dir / name
+            try:
+                if p.exists():
+                    return p.read_text(encoding="utf-8").strip().rstrip(".")
+            except Exception:
+                continue
+        return ""
 
     def status(self) -> dict:
         """客户端状态自检。"""
         info = self.read_devtools_port()
-        tok = self.harvest_from_file()
+        tok = self.harvest()
         return {
             "data_dir": str(self.data_dir),
             "data_dir_exists": self.data_dir.exists(),
             "install_dir": str(qoder_install_dir() or ""),
             "machine_id": self.read_machine_id(),
             "token_file_exists": (self.data_dir / self.TOKEN_FILE).exists(),
+            "auth_dat_exists": (self.data_dir / "auth.v1.dat").exists(),
             "token_found": tok is not None,
+            "token_source": tok.source if tok else "",
             "token_fresh": tok.is_fresh() if tok else False,
             "token_update": tok.update_dt.isoformat(sep=" ", timespec="seconds")
                             if tok and tok.update_dt else "",
@@ -312,3 +470,74 @@ def harvest_token(data_dir: str | Path | None = None) -> QoderToken | None:
 
 def client_status(data_dir: str | Path | None = None) -> dict:
     return QoderTokenHarvester(data_dir).status()
+
+
+# ============================================================ BCrypt 兜底
+def _bcrypt_gcm(key: bytes, payload: bytes) -> bytes:
+    """``cryptography`` 库不在时，用系统 BCrypt 解 AES-256-GCM。
+
+    ``payload`` = nonce(12) + ciphertext + tag(16)。
+    """
+    import ctypes
+    import struct
+
+    nonce = payload[:12]
+    ct_tag = payload[12:]
+    ciphertext = ct_tag[:-16]
+    tag = ct_tag[-16:]
+
+    bcrypt = ctypes.windll.bcrypt  # type: ignore[attr-defined]
+    hAlg = ctypes.c_void_p()
+    if bcrypt.BCryptOpenAlgorithmProvider(
+            ctypes.byref(hAlg), "AES", None, 0) != 0:
+        return b""
+    if bcrypt.BCryptSetProperty(
+            hAlg, "ChainingMode", "ChainingModeGCM",
+            len("ChainingModeGCM") + 1, 0) != 0:
+        return b""
+    hKey = ctypes.c_void_p()
+    key_buf = ctypes.create_string_buffer(key, len(key))
+    if bcrypt.BCryptGenerateSymmetricKey(
+            hAlg, ctypes.byref(hKey), None, 0, key_buf, len(key), 0) != 0:
+        return b""
+
+    class _AUTH_INFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong),
+                    ("dwInfoVersion", ctypes.c_ulong),
+                    ("pbNonce", ctypes.POINTER(ctypes.c_char)),
+                    ("cbNonce", ctypes.c_ulong),
+                    ("pbAuthData", ctypes.POINTER(ctypes.c_char)),
+                    ("cbAuthData", ctypes.c_ulong),
+                    ("pbTag", ctypes.POINTER(ctypes.c_char)),
+                    ("cbTag", ctypes.c_ulong),
+                    ("pbMacContext", ctypes.POINTER(ctypes.c_char)),
+                    ("cbMacContext", ctypes.c_ulong),
+                    ("cbAAD", ctypes.c_ulong),
+                    ("cbData", ctypes.c_ulong),
+                    ("cbData_high", ctypes.c_ulong),
+                    ("dwFlags", ctypes.c_ulong)]
+
+    auth = _AUTH_INFO()
+    auth.cbSize = ctypes.sizeof(auth)
+    auth.dwInfoVersion = 1
+    nonce_buf = ctypes.create_string_buffer(nonce, len(nonce))
+    auth.pbNonce = ctypes.cast(nonce_buf, ctypes.POINTER(ctypes.c_char))
+    auth.cbNonce = len(nonce)
+    tag_buf = ctypes.create_string_buffer(tag, len(tag))
+    auth.pbTag = ctypes.cast(tag_buf, ctypes.POINTER(ctypes.c_char))
+    auth.cbTag = len(tag)
+
+    out = ctypes.create_string_buffer(len(ciphertext))
+    out_len = ctypes.c_ulong(0)
+    ct_buf = ctypes.create_string_buffer(ciphertext, len(ciphertext))
+    status = bcrypt.BCryptDecrypt(
+        hKey, ct_buf, len(ciphertext),
+        ctypes.byref(auth), None, 0,
+        out, len(ciphertext), ctypes.byref(out_len), 0)
+    bcrypt.BCryptDestroyKey(hKey)
+    bcrypt.BCryptCloseAlgorithmProvider(hAlg, 0)
+    # 必须显式判 0：key/tag 不匹配时 ntstatus 非 0，不检查会把未初始化的
+    # 输出缓冲当明文返出去，下游 token 解析拿到垃圾数据还难以察觉
+    if status != 0:
+        return b""
+    return out.raw[:out_len.value]

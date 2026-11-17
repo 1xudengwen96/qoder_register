@@ -4,11 +4,14 @@
 # 所有密钥一律用 env:VAR_NAME 形式，禁止明文
 # ============================================================
 
-region: us                 # 默认出口地区：us / uk / jp / sg / de / hk
+region: sg                 # 默认出口地区；ipdeep 兜底只允许 us / sg
 concurrency: 1             # 领取阶段强制串行，不要改
 
 # ------------------------------------------------------------ 邮箱源
 mail:
+  # 明确指定只用哪个邮件源：outlook_file | outlook_tag | hotmail | icloud_relay
+  # 留空＝按下方 strategy / strict_priority_order 自动挑；指定的源不可用会直接报错
+  provider: ""
   # weighted: 按权重取；strict_priority: 按顺序优先耗尽；round_robin: 轮转
   strategy: strict_priority   # 先用清单里那 10 个真邮箱，耗尽了再往下掉
   # IMAP / 2Captcha 走的本机隧道（Clash 之类），留空＝直连
@@ -77,7 +80,7 @@ browser:
   bitbrowser:
     api_base: "http://127.0.0.1:54345"
     group_id: ""                 # 留空＝默认分组
-    reuse_env: true              # 同名环境复用（复用也会重写代理）
+    reuse_env: false            # 每轮新建窗口（指纹随机 + 代理写入后再启动）
     env_id: ""                   # 指定固定环境 id；留空按账号名自动建/找
     keep_open: false             # 跑完不关窗口（调试用）
     headless: false              # 比特客户端支持时再开
@@ -123,6 +126,11 @@ device:
   app_dir: ""                  # 留空自动探测 %APPDATA%\Qoder
   backup_dir: "data/device_backup"
   fake_hardware: false         # 生成假硬件 JSON；服务端做一致性校验时反而是破绽
+  # 身份模式：缺省/空 = 原随机方案（每轮全新随机身份）
+  # browser = 领取段设备身份匹配注册段比特浏览器画像
+  #   （同 seed 重建 FingerprintProfile 派生：平台/时区/语言/CPU/内存/GPU/分辨率
+  #     与注册环境一致，且同一账号跨重置不漂移）
+  identity_mode: ""
   # 可裁剪步骤：kill,machine_id,telemetry,cache,identity,advanced,login,hardware,chat
   steps: [kill, machine_id, telemetry, cache, identity, advanced, login, hardware, chat]
 
@@ -133,6 +141,13 @@ claim:
   wait_credit_timeout: 120
   capture_token: true
   credit_probe_url: ""         # 抓包拿到的额度接口，填了才能精确核对积分
+  # 领取登录模式：inherit（默认，继承已有登录态）/ cdp（半自动）。
+  # 设备重置会清空登录态，inherit 在全自动链路上等不到新 token；cdp 时人
+  # 点一次客户端「登录」，拿链接后 wait_link → drive_login → 回跳全自动
+  # （与 cli claim:run --login 同一套逻辑）。
+  login_mode: inherit
+  link_timeout: 180             # 等登录链接（剪贴板/浏览器历史）的秒数
+  login_timeout: 300            # 浏览器登录状态机的总超时
 
 # ------------------------------------------------------------ 代理
 # 支持格式（一行一条）：
@@ -162,6 +177,7 @@ proxy:
 
 # ------------------------------------------------------------ 地区画像
 region_profiles:
+  hk: { timezone: "Asia/Hong_Kong", locale: "zh-HK" }
   us: { timezone: "America/New_York", locale: "en-US" }
   uk: { timezone: "Europe/London", locale: "en-GB" }
   jp: { timezone: "Asia/Tokyo", locale: "ja-JP" }

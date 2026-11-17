@@ -27,15 +27,19 @@ import json
 import time
 from dataclasses import dataclass, field
 
+from PIL import Image
+
 from app.net.twocaptcha_click import TwoCaptchaClick, data_url_to_bytes
 
 IFRAME_ID = "baxia-dialog-content"
 CELL = 120
 
-JS_CAPTURE = r"""(() => {
+JS_CAPTURE = r"""(async () => {
   const CELL = 120;
   const GRID_SCALE = 1.6;          // 九宫格放大（坐标按这个算）
   const Q_SCALE = 3;               // 题干单独放大 3 倍给打工人看
+  const AVG_FRAMES = 30;           // 目标图案 canvas 逐帧平均帧数
+  const AVG_STEP = 35;             // 每帧间隔 ms
   const fr = document.getElementById('baxia-dialog-content') ||
     Array.from(document.querySelectorAll('iframe'))
       .find(f => (f.src || '').includes('tmd') || (f.src || '').includes('punish'));
@@ -65,15 +69,48 @@ JS_CAPTURE = r"""(() => {
     try { gctx.drawImage(g, gx, gy, GH, GH); } catch (e) {}
   });
 
-  const qw = (q.width || 355) * Q_SCALE;
-  const qh = (q.height || 48) * Q_SCALE;
-  // 「要匹配的图案」是另一个无 id 的方形 canvas（实测 80x80），放大 4 倍
+  // 「要匹配的图案」是另一个无 id 的方形 canvas（实测 80x80）。
+  // 实测它被**逐帧随机噪点**覆盖（单帧截图 = 纯噪点，打工人无法解题），
+  // 帧间平均后噪点抵消、恒定图案浮现（2026-11-17 实测重建出清晰 QR 码）。
   const descCanvas = Array.from(d.querySelectorAll('canvas')).find(
     c => !/^click-grid-/.test(c.id) && c.id !== 'click-question-canvas' &&
          c.width > 20);
+  let descAvg = null, descW = 0, descH = 0;
+  if (descCanvas) {
+    const w = descCanvas.width, h = descCanvas.height;
+    const acc = new Float64Array(w * h * 3);
+    const tmp = d.createElement('canvas');
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext('2d', {willReadFrequently: true});
+    let n = 0;
+    for (let i = 0; i < AVG_FRAMES; i++) {
+      tctx.clearRect(0, 0, w, h);
+      tctx.drawImage(descCanvas, 0, 0);
+      const px = tctx.getImageData(0, 0, w, h).data;
+      for (let p = 0, q = 0; p < px.length; p += 4, q += 3) {
+        acc[q] += px[p]; acc[q + 1] += px[p + 1]; acc[q + 2] += px[p + 2];
+      }
+      n++;
+      await new Promise(r => setTimeout(r, AVG_STEP));
+    }
+    const avg = d.createElement('canvas');
+    avg.width = w; avg.height = h;
+    const actx = avg.getContext('2d');
+    const aimg = actx.createImageData(w, h);
+    const ad = aimg.data;
+    for (let p = 0, q = 0; p < ad.length; p += 4, q += 3) {
+      ad[p] = acc[q] / n; ad[p + 1] = acc[q + 1] / n;
+      ad[p + 2] = acc[q + 2] / n; ad[p + 3] = 255;
+    }
+    actx.putImageData(aimg, 0, 0);
+    descAvg = avg; descW = w; descH = h;
+  }
+
+  const qw = (q.width || 355) * Q_SCALE;
+  const qh = (q.height || 48) * Q_SCALE;
   const DS = 4;
-  const dw = descCanvas ? descCanvas.width * DS : 0;
-  const dh = descCanvas ? descCanvas.height * DS : 0;
+  const dw = descAvg ? descW * DS : 0;
+  const dh = descAvg ? descH * DS : 0;
   const W2 = Math.max(qw, dw);
   const qc = d.createElement('canvas');
   qc.width = W2; qc.height = qh + dh;
@@ -81,8 +118,8 @@ JS_CAPTURE = r"""(() => {
   qctx.fillStyle = '#fff'; qctx.fillRect(0, 0, qc.width, qc.height);
   qctx.imageSmoothingEnabled = true;
   try { qctx.drawImage(q, 0, 0, qw, qh); } catch (e) {}
-  if (descCanvas) {
-    try { qctx.drawImage(descCanvas, 0, qh, dw, dh); } catch (e) {}
+  if (descAvg) {
+    try { qctx.drawImage(descAvg, 0, qh, dw, dh); } catch (e) {}
   }
 
   // 2Captcha 限制 100KB，按体积自适应压成 JPEG
@@ -218,10 +255,13 @@ class BaxiaClickCaptcha:
 
     # ---------------------------------------------------------- 取图
     def capture(self, retries: int = 5) -> dict:
-        """取图。换题/提交后组件会重建，这里等一下再取，避免拿到 no-widget。"""
+        """取图。换题/提交后组件会重建，这里等一下再取，避免拿到 no-widget。
+
+        JS_CAPTURE 是 async（含 30 帧噪点平均，约 1.1s），必须 await_promise。
+        """
         data: dict = {}
         for i in range(1, retries + 1):
-            data = self.page.eval(JS_CAPTURE) or {}
+            data = self.page.eval(JS_CAPTURE, await_promise=True) or {}
             if not data.get("error"):
                 return data
             self._d(f"取图第 {i} 次: {data.get('error')}")
@@ -256,23 +296,52 @@ class BaxiaClickCaptcha:
         return clicked
 
     def screenshot_instructions(self, scale: float = 3.0) -> bytes | None:
-        """截 iframe 顶部题面区域（题干文字 + 目标图案的渲染结果）。"""
+        """截 iframe 顶部题面区域（题干文字 + 目标图案的渲染结果）。
+
+        题干 canvas 与目标图案 canvas 都是**逐帧随机噪点**动画（单帧截图
+        = 噪点糊成一片，打码员读不出描述，只能瞎猜格子 —— 2026-11-17
+        实测：单帧读不出，2Captcha 答错格；10 帧平均后描述清晰浮现
+        "phone case with maple leaf"）。所以这里连拍 AVG 张、逐像素平均
+        再压回 JPEG。噪点零均值，恒定文字/图案帧间抵消。
+        """
         rect = self.page.eval(JS_IFRAME_RECT) or {}
         if not rect or rect.get("error"):
             return None
         import base64
+        import io
 
-        try:
-            res = self.page.cdp.call("Page.captureScreenshot", {
-                "format": "jpeg", "quality": 90,
-                "clip": {"x": rect["x"], "y": max(0.0, rect["y"]),
-                         "width": rect["w"], "height": 130,
-                         "scale": scale},
-            })
-            return base64.b64decode(res["data"])
-        except Exception as exc:
-            self._d(f"题面截图失败: {type(exc).__name__}")
+        frames = []
+        for _ in range(10):
+            try:
+                res = self.page.cdp.call("Page.captureScreenshot", {
+                    "format": "png",
+                    "clip": {"x": rect["x"], "y": max(0.0, rect["y"]),
+                             "width": rect["w"], "height": 130,
+                             "scale": scale},
+                })
+                frames.append(Image.open(io.BytesIO(
+                    base64.b64decode(res["data"]))))
+            except Exception as exc:
+                self._d(f"题面截图失败: {type(exc).__name__}")
+                return None
+            time.sleep(0.12)
+        if not frames:
             return None
+        try:
+            import numpy as np
+
+            arr = np.stack([np.asarray(f.convert("RGB"), dtype=np.float64)
+                            for f in frames])
+            avg = Image.fromarray(arr.mean(axis=0).round().astype("uint8"))
+        except Exception:
+            avg = frames[-1].convert("RGB")   # numpy 不可用时退回单帧
+        buf = io.BytesIO()
+        for quality in (0.9, 0.75, 0.6):
+            buf = io.BytesIO()
+            avg.save(buf, format="JPEG", quality=int(quality * 100))
+            if buf.tell() < 128000:
+                break
+        return buf.getvalue()
 
     def selected(self) -> list[int]:
         return list(self.centers().get("selected") or [])
@@ -291,9 +360,10 @@ class BaxiaClickCaptcha:
               save_path: str = "") -> BaxiaResult:
         res = BaxiaResult(ok=False)
         comment = ("body 图是 3x3 九宫格照片。imgInstructions 图：上面是题干文字，"
-                   "下面是要找的目标图案（已放大 4 倍）。"
+                   "下面是从动态噪点中多帧平均重建的目标图案（可能呈文字/"
+                   "二维码/图形状，描述文字已降噪清晰可读）。"
                    "请在九宫格中选出所有包含该目标图案的格子，返回这些格子中心点在 body 图中的坐标"
-                   "（可以多个）。若一个都没有，返回空数组。")
+                   "（可以多个）。若一个都没有，返回空数组（页面会直接点 Submit）。")
         for attempt in range(1, max_attempts + 1):
             data = self.capture()
             if data.get("error"):

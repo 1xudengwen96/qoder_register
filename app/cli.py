@@ -171,6 +171,20 @@ def cmd_device_reset(args) -> int:
         backup_dir=get(cfg, "device.backup_dir", "data/device_backup"),
     )
     steps = tuple(args.steps.split(",")) if args.steps else tuple(ALL_STEPS)
+
+    # 身份模式：默认不传 = 原随机方案；browser = 匹配注册段浏览器画像
+    profile = None
+    mode = (args.identity_mode
+            or str(get(cfg, "device.identity_mode", "") or "")).strip().lower()
+    if mode in ("browser", "match", "fingerprint_browser"):
+        from app.device.identity_profile import profile_from_browser
+        from app.register.fingerprint_engine import make_profile
+
+        seed = args.seed or "manual"
+        profile = profile_from_browser(
+            make_profile(region=(args.region or "us").lower(), seed=seed))
+        log.info("设备身份=浏览器匹配画像 %s", profile.brief())
+
     report = reset.run(ResetOptions(
         steps=steps,
         dry_run=not args.execute,
@@ -178,6 +192,7 @@ def cmd_device_reset(args) -> int:
         fake_hardware=args.fake_hardware,
         timezone=args.timezone,
         backup=not args.no_backup,
+        profile=profile,
     ))
     print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     return 0 if report.ok else 2
@@ -529,60 +544,47 @@ def cmd_claim_one(args) -> int:
     ui = None
     login_state: dict = {}
     if args.login:
-        from app.claim import ui_login
-        from app.net.proxy import ProxyLedger, ProxyPool, acquire_once
+        from app.claim.ui_login import make_ui_login
 
-        def _ui_login(_claimer) -> bool:
-            print("请在弹出的 Qoder 客户端窗口点一次「登录」（或点「复制登录链接」）…")
-            print(f"我在等登录链接，最多 {args.link_timeout}s（剪贴板 / 浏览器历史都会看）")
-            started = time.time()
-            link, src = ui_login.wait_link(timeout=args.link_timeout, since=started)
-            if not link:
-                print("没等到登录链接")
-                return False
-            print(f"拿到链接（来源={src}）: {link[:100]}…")
-            pool = ProxyPool.from_file(get(cfg, "proxy.file", "data/proxies.txt"))
-            ledger = ProxyLedger(get(cfg, "proxy.state_file", "data/.proxy_state.json"))
-            px = acquire_once(pool, ledger, region=get(cfg, "region", "us"))
-            out = ui_login.drive_login(
-                cfg, link, email, password,
-                env_name=f"login_{args.env_name or 'one'}",
-                region=get(cfg, "region", "us"),
-                timeout=args.login_timeout, proxy=px,
-                artifacts_dir=get(cfg, "storage.artifacts_dir", "data/artifacts"),
-            )
-            print(f"浏览器登录结果: {out.as_dict()}")
-            if not out.ok:
-                return False
-            ledger.mark(px, env=out.env_id, note="login")
-            login_state["credits"] = out.credits
-            login_state["plan"] = out.plan
-            login_state["detail"] = out.credits_detail
-            if out.deep_link:
-                return ui_login.dispatch_deep_link(out.deep_link)
-            return True
-
-        ui = _ui_login
+        # 与 orchestrator 领取段（claim.login_mode=cdp）同一套半自动登录。
+        # 一一对应：优先用注册环境名 acct{id}（查 db 拿账号 id）
+        with session_scope() as s:
+            _row = (s.query(Account).filter(Account.email == email)
+                    .order_by(Account.id.asc()).first())
+            _env = f"acct{_row.id}" if _row else f"login_{args.env_name or 'one'}"
+        ui, login_state = make_ui_login(
+            cfg, email, password,
+            env_name=_env,
+            region=get(cfg, "region", "us"),
+            link_timeout=args.link_timeout,
+            login_timeout=args.login_timeout,
+            artifacts_dir=get(cfg, "storage.artifacts_dir", "data/artifacts"),
+        )
 
     res = claimer.perform(email, password, ui_login=ui)
 
-    # 登录会话里已经读到额度就直接用；否则再开窗口读一次
-    if res.credits <= 0 and login_state.get("credits"):
-        res.credits = int(login_state["credits"])
-        res.plan = login_state.get("plan") or res.plan
-        print(f"登录会话额度: {login_state.get('detail')} 计划={res.plan}")
-    elif res.credits <= 0:
-        from app.claim.credit_page import read_credits
+    # 一一对应：领取/额度兜底优先复用注册环境 acct{id}（同指纹代理 IP，
+    # cookie 在）；查不到账号（外部导入）才退回 login_* 命名环境
+    with session_scope() as s:
+        _row = s.query(Account).filter(Account.email == email).first()
+        _acct_id = _row.id if _row else None
+    env_base = (f"acct{_acct_id}" if _acct_id
+                else f"login_{args.env_name or 'one'}")
 
-        cred = read_credits(cfg, env_name=f"login_{args.env_name or 'one'}",
-                            region=get(cfg, "region", "us"))
-        if cred.total or cred.left:
-            res.credits = cred.credits
-            print(f"账号页额度: {cred.as_dict()} 计划={cred.plan}")
-        else:
-            print(f"账号页额度: {cred.as_dict()} 计划={cred.plan}"
-                  f"（还没在客户端领取？）")
-        res.plan = res.plan if (res.plan and res.plan != "pro_trial") else (cred.plan or res.plan)
+    # 登录会话里已经读到额度就直接用；否则再开窗口读一次
+    from app.claim.claimer import apply_credits_fallback
+
+    src = apply_credits_fallback(
+        res, login_state, cfg,
+        env_name=env_base,
+        region=get(cfg, "region", "us"),
+    )
+    if src == "login-session":
+        print(f"登录会话额度: {login_state.get('detail')} 计划={res.plan}")
+    elif src == "account-page":
+        print(f"账号页额度: {login_state.get('_page')} 计划={res.plan}")
+        if res.credits <= 0:
+            print("（还没在客户端领取？权益可能尚未到账）")
 
     print(json.dumps({
         "ok": res.ok, "credits": res.credits, "plan": res.plan,
@@ -598,14 +600,16 @@ def cmd_claim_one(args) -> int:
             s.flush()
         if res.token:
             acc.token_json = json.dumps(res.token, ensure_ascii=False)
-        if res.ok and res.credits > 0:
+        if res.ok:
+            # token 已入库 = 客户端登录已生效；credits 读不到不再卡 CLAIMED——
+            # 记 credits_unknown 旗标，库存按 0 额度进 D 级，可人工复核
             acc.state = AccountState.STOCK
             acc.credits = res.credits
             acc.plan = res.plan or acc.plan
             acc.trial_expire_at = res.expire_at
             acc.claimed_at = datetime.now()
-        elif res.ok:
-            acc.state = AccountState.CLAIMED if acc.state != AccountState.STOCK else acc.state
+            if res.credits <= 0:
+                acc.add_flag("credits_unknown")
         rep = export_all(s, get(cfg, "storage.output_dir", "data/output"))
 
     print(f"账号已更新（状态 {acc.state.value}），输出: {rep.files.get('accounts')}")
@@ -876,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--fake-hardware", action="store_true")
     s.add_argument("--timezone", default="America/New_York")
     s.add_argument("--no-backup", action="store_true")
+    s.add_argument("--identity-mode", default=None, choices=["browser"],
+                   help="browser=设备身份匹配注册段浏览器画像（缺省=原随机方案）")
+    s.add_argument("--seed", default="",
+                   help="identity-mode=browser 时的画像种子（与账号 tag 一致）")
+    s.add_argument("--region", default="us", help="identity-mode=browser 时的地区")
     s.set_defaults(func=cmd_device_reset)
 
     s = sub.add_parser("device:restore", help="从备份回滚")

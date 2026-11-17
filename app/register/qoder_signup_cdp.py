@@ -224,8 +224,13 @@ class QoderSignupCDP:
 
     # ---------------------------------------------------------- 按钮
     def _click_submit(self, names=("Continue", "Verify", "Submit", "Next",
-                                   "Sign up", "Confirm")) -> str:
-        """点可见的提交按钮，返回点到了哪个文案。"""
+                                   "Sign up", "Confirm",
+                                   "继续", "下一步", "提交", "注册",
+                                   "确认")) -> str:
+        """点可见的提交按钮，返回点到了哪个文案。
+
+        中英文都认（acct22 实测：中文页面按钮是「继续」，只匹配英文会漏点）。
+        """
         for want in names:
             js = """(() => {
               const want = %s;
@@ -266,6 +271,37 @@ class QoderSignupCDP:
         self.page.goto(HOME_URL, wait_ms=random.randint(1800, 3200))
         self.page.move(random.randint(200, 700), random.randint(150, 500))
         self.page.goto(SIGNUP_URL, wait_ms=random.randint(1500, 2600))
+
+        # 已登录态兜底：复用 env 跨账号时服务端会直接跳到 /account/profile
+        # 找不到注册表单。先点 Log out 再回 sign-up。
+        if not self.page.sel_ready("#basic_firstName", timeout=2):
+            cur = self.page.url()
+            if "/account/" in cur or "/sign-in" not in cur:
+                self._stage("① 检测已登录", True, f"先登出 url={cur[:80]}")
+                # 调客户端的退出（POST 带 CSRF token；Rails 会校验）
+                self.page.eval(
+                    "(async()=>{try{const m=document.querySelector("
+                    "'meta[name=csrf-token]');"
+                    "await fetch('/users/sign_out',{method:'POST',"
+                    "credentials:'include',headers:{'X-CSRF-Token':"
+                    "(m?m.content:''),'X-Requested-With':'XMLHttpRequest'}})}"
+                    "catch(e){}})()",
+                    await_promise=True)
+                self.page.goto(SIGNUP_URL, wait_ms=random.randint(1500, 2600))
+                # 登出没生效（会话 cookie 还在，服务端仍重定向回 /account）
+                # → CDP 清掉全部 cookie 强制回到未登录态
+                if not self.page.sel_ready("#basic_firstName", timeout=3):
+                    self._d("登出未生效，CDP 清 cookie 强制登出")
+                    try:
+                        self.page.cdp.call("Network.enable")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        self.page.cdp.call("Network.clearBrowserCookies")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.page.goto(SIGNUP_URL,
+                                   wait_ms=random.randint(1800, 3000))
 
         if not self.page.sel_ready("#basic_firstName", timeout=30):
             self._stage("① 注册页", False, f"没有姓名输入框 url={self.page.url()}")
@@ -326,8 +362,7 @@ class QoderSignupCDP:
         solver = AliyunSliderCDP(self.page, human=self.human, logger=self.log,
                                  paid_client=self.paid,
                                  prefer_paid=self.prefer_paid,
-                                 proxy=self.proxy,
-                                 local_fallback=not self.prefer_paid)
+                                 proxy=self.proxy)
         res = solver.solve(max_attempts=self.captcha_max_attempts)
         if not res.ok:
             self._shot("captcha_fail")
@@ -507,6 +542,47 @@ class QoderSignupCDP:
         path.write_text(html, encoding="utf-8", errors="ignore")
         self.report.artifacts.append(str(path))
         return str(path)
+
+    def _goback_recover(self) -> bool:
+        """「假通过死页」兑底：组件显示 Verified 但表单不推进（无 button/
+        form，只剩 "Go back"）。点 Go back 恢复注册表单。
+
+        根因：滑块判定延迟 + 过早 refresh 打断 success 回调（见
+        aliyun_slider_cdp.solve 的延迟判定容忍）。2026-11-17 acct21/22 实测：
+        点 Go back（SPAN）后 Email/Password/Continue 表单立即回来。
+        中文页面文案是「返回」（acct22），英文是 "Go back"，两者都匹配。
+        """
+        got = self.page.eval(r"""(() => {
+          const vis = e => !!(e.offsetWidth || e.offsetHeight ||
+                                e.getClientRects().length);
+          const btns = Array.from(document.querySelectorAll(
+              'button, [role=button]')).filter(vis);
+          if (btns.length) return {error: 'has-buttons'};
+          const txt = (document.body ? document.body.innerText : '') || '';
+          if (!/go\s*back/i.test(txt) && !txt.includes('返回')) {
+            return {error: 'no-goback'};
+          }
+          const want = e => {
+            const t = (e.innerText || '').trim();
+            return /^go\s*back$/i.test(t) || t === '返回';
+          };
+          for (const e of document.querySelectorAll('*')) {
+            if (!vis(e) || !want(e)) continue;
+            if (e.children.length) continue;      // 要叶子节点
+            const r = e.getBoundingClientRect();
+            if (r.width < 2) continue;
+            return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+          }
+          return {error: 'goback-not-found'};
+        })()""")
+        if not got or got.get("error"):
+            return False
+        self._d(f"假通过死页：点 Go back 恢复表单 {got}")
+        self.page.click_xy(float(got["x"]), float(got["y"]), human=self.human)
+        # 实测（acct21）：回到的是 Email/Password（②步）表单；也可能是①步全表单
+        return self.page.wait_js(
+            "(() => !!document.querySelector('#basic_password') || "
+            "!!document.querySelector('#basic_firstName'))()", timeout=10)
 
     def step_otp(self, code_provider) -> bool:
         otp_wait = self.page.wait_js(
@@ -706,6 +782,27 @@ class QoderSignupCDP:
             self._stage("⑤ 登录态", True, f"url 已跳转（正文 {len(body)} 字）")
         return True
 
+    def _retry_flow(self, email: str, first: str, last: str, pwd: str,
+                    code_provider) -> bool:
+        """Go back 恢复表单后重走 ①②③④。
+
+        实测（acct21）：Go back 回到 Email/Password（②步）表单；有的情况回①步
+        全表单，这里两种都兼容。环境已过一次滑块，重走时大多无感通过。
+        """
+        self._sleep(1.5, 2.5)
+        ok = True
+        if self.page.exists("#basic_firstName"):          # 回到①步全表单
+            ok = self.step_identity(email, first, last)
+            self._sleep(1.5, 2.5)
+        if not (ok and self.step_password(pwd)):
+            return False
+        self._sleep(2.0, 3.0)
+        if not self.step_captcha():
+            return False
+        if code_provider is not None and not self.step_otp(code_provider):
+            return False
+        return True
+
     # ---------------------------------------------------------- 主流程
     def run(self, email: str, password: str | None = None,
             code_provider=None, stop_before: str = "") -> FlowReport:
@@ -738,16 +835,32 @@ class QoderSignupCDP:
                 res.stage, res.detail = "step2", "第②步失败"
                 return self._finish(res)
             self._sleep(2.0, 3.5)
+            otp_done = False          # Go back 重走时若已含④，就不再跑一遍
             if not self.step_captcha():
-                res.stage, res.detail = "step3", "第③步滑块未通过"
-                return self._finish(res)
+                # 兑底：明确拒绝（错误条）后 refresh 常把组件锁死（expand-lock）
+                # 或判定延迟被打断成「Verified|Go back」假通过页。点 Go back
+                # 恢复表单重走 ①②③④（acct21 实测可恢复）。
+                if self._goback_recover() and \
+                        self._retry_flow(email, first, last, pwd, code_provider):
+                    otp_done = code_provider is not None
+                    self._d("③ 失败后 Go back 重走成功")
+                else:
+                    res.stage, res.detail = "step3", "第③步滑块未通过"
+                    return self._finish(res)
 
             if code_provider is None:
                 res.stage, res.detail = "step4", "没有收码回调"
                 return self._finish(res)
-            if not self.step_otp(code_provider):
-                res.stage, res.detail = "step4", "第④步 OTP 未通过"
-                return self._finish(res)
+            if not otp_done and not self.step_otp(code_provider):
+                # 兑底：判定延迟被打断后死在「Verified|Go back」假通过页。
+                # 点 Go back 恢复表单，重走 ①②③④。
+                if self._goback_recover() and \
+                        self._retry_flow(email, first, last, pwd, code_provider):
+                    res.ok, res.stage = True, "step4"
+                    res.detail = "OTP 补救（Go back 恢复）"
+                else:
+                    res.stage, res.detail = "step4", "第④步 OTP 未通过"
+                    return self._finish(res)
 
             res.ok, res.stage, res.detail = True, "done", "注册完成"
             res.url = self.page.url()

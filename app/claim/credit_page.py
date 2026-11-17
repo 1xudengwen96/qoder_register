@@ -49,8 +49,13 @@ class Credits:
 
     @property
     def credits(self) -> int:
-        """入库用的“持有额度”：优先剩余，其次总量。"""
-        return self.left or self.total
+        """入库用的“持有额度”：优先剩余，其次总量。
+
+        之前写 ``self.left or self.total``，剩余恰好为 0（已用光/权益还没
+        到账）会被误报成总量 300。改成只信 usage 页读到的 left——
+        ``source`` 是 ``usage-page`` 才算真读到，0 也是有效值。
+        """
+        return self.left if self.source.startswith("usage-page") else self.total
 
     def as_dict(self) -> dict:
         return {"used": self.used, "total": self.total, "left": self.left,

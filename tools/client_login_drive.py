@@ -108,8 +108,11 @@ def main() -> int:
                 print(f"\n没找到含「{args.click}」的可点元素")
                 return 1
             print(f"\n点击 ({hit['x']},{hit['y']}) {hit['text']}")
-            page.mouse("mousePressed", hit["x"], hit["y"], buttons=1)
-            page.mouse("mouseReleased", hit["x"], hit["y"], buttons=0)
+            # cdp_raw.CDP 没有 mouse 封装，直接发 Input.dispatchMouseEvent
+            for typ, btns in (("mousePressed", 1), ("mouseReleased", 0)):
+                page.call("Input.dispatchMouseEvent", {
+                    "type": typ, "x": float(hit["x"]), "y": float(hit["y"]),
+                    "button": "left", "clickCount": 1, "buttons": btns})
             time.sleep(4)
             after = page.evaluate(JS_DUMP) or {}
             print("点击后正文:", (after.get("body") or "")[:600].replace("\n", " | "))

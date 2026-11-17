@@ -112,9 +112,11 @@ class Claimer:
             except Exception:
                 return False
         try:
+            # 中文 Windows tasklist 输出 GBK；默认 utf-8 解码会让 stdout 变 None
             out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Qoder.exe", "/NH"],
-                                 capture_output=True, text=True, timeout=15)
-            return "Qoder.exe" in out.stdout
+                                 capture_output=True, text=True, timeout=15,
+                                 encoding="gbk", errors="replace")
+            return "Qoder.exe" in (out.stdout or "")
         except Exception:
             return False
 
@@ -180,21 +182,32 @@ class Claimer:
 
     # ---------------------------------------------------------- Token
     def snapshot_token(self) -> QoderToken | None:
-        """取当前 token 快照（用于判断是否换了号）。"""
-        return self.harvester.harvest_from_file()
+        """取当前 token 快照（用于判断是否换了号）。
+
+        0.3.x：读 ``machine_token.json`` 明文；
+        0.4.x：DPAPI 解 ``auth.v1.dat``（走 ``harvest`` 自动降级，不要直接调
+        ``harvest_from_file``，否则 0.4.x 永远拿不到 token）。
+        """
+        return self.harvester.harvest()
 
     def wait_new_token(self, old_token: str = "",
                        timeout: int | None = None) -> QoderToken | None:
-        """等 token 变化（说明新账号登录生效）。"""
+        """等 token 变化（说明新账号登录生效）。
+
+        必须走 ``harvest()`` 全链路降级（machine_token → safe_storage → CDP → leveldb）：
+        0.4.x 客户端的 token 在 ``auth.v1.dat``（DPAPI 解密），而
+        ``harvest_from_file`` 只认 0.3.x 的明文 JSON —— 直接调它在 0.4.x 上
+        永远拿不到 token，整个领取流程会卡在「未抓到 token」。
+        """
         timeout = timeout if timeout is not None else self.relogin_timeout
         deadline = time.time() + timeout
         while time.time() < deadline:
-            tok = self.harvester.harvest_from_file()
+            tok = self.harvester.harvest()
             if tok and tok.token != old_token:
                 return tok
             time.sleep(2)
         # 超时也返回当前 token（可能是同号重登）
-        return self.harvester.harvest_from_file()
+        return self.harvester.harvest()
 
     # ---------------------------------------------------------- 额度核对
     def probe_credits(self, token: QoderToken | None) -> tuple[int, str, datetime | None]:
@@ -231,12 +244,34 @@ class Claimer:
         expire_raw = node.get(self.expire_field) if isinstance(node, dict) else None
         expire = None
         if expire_raw:
+            raw = str(expire_raw).strip()
+            # 注意必须完整匹配：之前用 raw[:19] 截断，带 Z / +08:00 的
+            # ISO 串会被 naive 格式“看起来匹配”截命中，时区信息被丢掉。
             for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
                 try:
-                    expire = datetime.strptime(str(expire_raw)[:19], fmt)
+                    expire = datetime.strptime(raw, fmt)
                     break
                 except ValueError:
                     continue
+        if expire is None and expire_raw:
+            # 带时区/UTC 格式：ISO 8601（Z / +08:00）→ RFC 1123（HTTP 接口
+            # 常见的 GMT 格式）。之前只试 naive strptime，遇到这两种会
+            # 静默落到 now+14d 兜底，到期预警全错。
+            raw = str(expire_raw).strip()
+            dt = None
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    from email.utils import parsedate_to_datetime
+
+                    dt = parsedate_to_datetime(raw)
+                except Exception:  # noqa: BLE001
+                    dt = None
+            if dt is not None:
+                if dt.tzinfo is not None:  # 入库统一 naive 本地时间
+                    dt = dt.astimezone().replace(tzinfo=None)
+                expire = dt
         return credits, plan, expire
 
     # ---------------------------------------------------------- 主流程
@@ -318,3 +353,39 @@ class Claimer:
         st["client_exists"] = Path(self.client_path).exists()
         st["running"] = self.is_running()
         return st
+
+
+# ------------------------------------------------------------ 额度兜底
+def apply_credits_fallback(
+    cres: "ClaimResult",
+    login_state: dict,
+    cfg,
+    env_name: str = "",
+    region: str = "us",
+) -> str:
+    """perform 没读到额度时的兜底，cli ``claim:run`` 与 orchestrator 领取段共用。
+
+    顺序：① 登录会话里 usage 页已读到（``login_state["credits"]``）→ 直接用；
+    ② ``read_credits`` 再开比特浏览器窗口读一次账号页。
+
+    返回实际用到的来源：``""``（本就有额度）/ ``"login-session"`` /
+    ``"account-page"``；credits 仍是 0 不算失败，可能只是权益还没到账
+    （账号页仍在提示「去客户端领取」）。读到账号页时会把 ``cred.as_dict()``
+    放进 ``login_state["_page"]`` 供调用方打印。
+    """
+    if cres.credits > 0:
+        return ""
+    if login_state.get("credits"):
+        cres.credits = int(login_state["credits"])
+        cres.plan = login_state.get("plan") or cres.plan
+        return "login-session"
+
+    from app.claim.credit_page import read_credits
+
+    cred = read_credits(cfg, env_name=env_name or "qoder_login", region=region)
+    login_state["_page"] = cred.as_dict()
+    if cred.source.startswith("usage-page"):
+        cres.credits = cred.credits
+        if cred.plan and (not cres.plan or cres.plan == "pro_trial"):
+            cres.plan = cred.plan
+    return "account-page"

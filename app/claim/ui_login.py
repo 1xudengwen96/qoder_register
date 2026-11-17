@@ -225,7 +225,7 @@ def _visible(page, selector: str) -> bool:
 
 
 def _solve_slider(page, cfg, proxy_raw: str | None) -> str:
-    """人机验证（阿里云 FeiLin）：2Captcha 优先，本地兜底。"""
+    """人机验证（阿里云 FeiLin）：只走 2Captcha（本地识别已移除）。"""
     from app.net.twocaptcha_dragdrop import TwoCaptchaDragDrop
     from app.register.aliyun_slider_cdp import AliyunSliderCDP
 
@@ -288,10 +288,24 @@ def drive_login(
     page = None
     proxy_raw = getattr(proxy, "raw", None)
     try:
-        launch = bb_cdp.open_for_register(
-            client, proxy=proxy, region=region,
-            env_name=env_name or "qoder_login", reuse_env=True,
-        )
+        env_name = env_name or "qoder_login"
+        reused_id = bb_cdp.find_env_id(client, env_name) or ""
+        if reused_id:
+            # 一一对应：注册环境的指纹 / 代理 / IP / 登录 cookie 全部
+            # 保持原样（不重写代理，直连重写会换 IP 踢会话），只启动。
+            endpoint, res = bb_cdp.launch_env(client, reused_id)
+            launch = bb_cdp.BBLaunch(
+                env_id=reused_id, env_name=env_name, endpoint=endpoint,
+                created=False, pid=res.pid, core_version=res.core_version,
+                proxy_label="复用注册环境", proxy_raw=(proxy_raw or ""),
+            )
+            log.info("复用环境 %s（注册一一对应，代理不改写）cdp=%s",
+                      env_name, endpoint)
+        else:
+            launch = bb_cdp.open_for_register(
+                client, proxy=proxy, region=region,
+                env_name=env_name, reuse_env=True,
+            )
         out.env_id = launch.env_id
         log.info("登录窗口 env=%s cdp=%s 代理=%s", launch.env_name,
                  launch.endpoint, launch.proxy_label)
@@ -307,7 +321,9 @@ def drive_login(
             url = str(st.get("url") or "")
             text = str(st.get("text") or "")
             low = text.lower()
-            deep = str(st.get("deep") or "")
+            # 键名必须与 _JS_PAGE_STATE 返回的 deepLink 一致
+            # （之前误写成 st.get("deep")，导致 qoder:// 回跳永远抓不到）
+            deep = str(st.get("deepLink") or "")
             if deep:
                 out.deep_link = deep
                 out.ok = True
@@ -415,12 +431,27 @@ def drive_login(
                 if did["account"] < 3:
                     did["account"] += 1
                     log.info("账号选择页（第 %d 次）", did["account"])
-                    for name in ("Continue", "继续", "Select", "选择", "确认"):
-                        try:
-                            if page.click_text(name):
-                                break
-                        except Exception:  # noqa: BLE001
-                            continue
+                    # 主确认按钮（繼續/Continue/继续）统一是 ant-btn-primary：
+                    # 语言无关（us 英 / hk 繁中 / 简中三套文案都不用猜），
+                    # 原生 click 实测有效。文本匹配只做兜底。
+                    clicked = False
+                    try:
+                        clicked = bool(page.eval(
+                            "(() => { const b = document.querySelector("
+                            "'button.ant-btn-primary');"
+                            " if (!b) return false; b.click(); return true; })()"))
+                    except Exception:  # noqa: BLE001
+                        clicked = False
+                    if not clicked:
+                        for name in ("Continue", "继续", "繼續", "Select",
+                                     "选择", "選擇", "确认", "確認"):
+                            try:
+                                if page.click_text(name):
+                                    clicked = True
+                                    break
+                            except Exception:  # noqa: BLE001
+                                continue
+                    log.info("账号选择页点击 -> %s", clicked)
                     time.sleep(3)
                 continue
 
@@ -484,3 +515,62 @@ def dispatch_deep_link(deep_link: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("投递回跳链接失败：%s", exc)
         return False
+
+
+# ------------------------------------------------------------ 回调工厂
+def make_ui_login(
+    cfg,
+    email: str,
+    password: str,
+    *,
+    env_name: str = "",
+    region: str = "us",
+    link_timeout: int = 180,
+    login_timeout: int = 300,
+    artifacts_dir: str | Path = "data/artifacts",
+) -> tuple[object, dict]:
+    """构造给 ``Claimer.perform(ui_login=...)`` 用的半自动登录回调。
+
+    cli ``claim:run --login`` 与 orchestrator 领取段（``claim.login_mode: cdp``）
+    共用这套逻辑：提示人点一次客户端「登录」（或「复制登录链接」）→
+    ``wait_link`` 拿 selectAccounts 链接 → 取代理 → ``drive_login`` 走网页
+    登录 → ``dispatch_deep_link`` 回跳客户端写 token。
+
+    返回 ``(回调, state)``；登录成功后 ``state`` 带 usage 页读到的
+    credits / plan / credits_detail（给额度兜底用）。
+    """
+    from app.config import get
+    from app.net.proxy import ProxyLedger, ProxyPool, acquire_once
+
+    state: dict = {}
+
+    def _ui(_claimer) -> bool:
+        print("请在弹出的 Qoder 客户端窗口点一次「登录」（或点「复制登录链接」）…")
+        print(f"我在等登录链接，最多 {link_timeout}s（剪贴板 / 浏览器历史都会看）")
+        started = time.time()
+        link, src = wait_link(timeout=link_timeout, since=started)
+        if not link:
+            log.warning("没等到登录链接")
+            return False
+        log.info("拿到链接（来源=%s）: %s…", src, link[:100])
+        pool = ProxyPool.from_file(get(cfg, "proxy.file", "data/proxies.txt"))
+        ledger = ProxyLedger(get(cfg, "proxy.state_file", "data/.proxy_state.json"))
+        px = acquire_once(pool, ledger, region=region)
+        out = drive_login(
+            cfg, link, email, password,
+            env_name=env_name or "qoder_login",
+            region=region, timeout=login_timeout, proxy=px,
+            artifacts_dir=artifacts_dir,
+        )
+        log.info("浏览器登录结果: %s", out.as_dict())
+        if not out.ok:
+            return False
+        ledger.mark(px, env=out.env_id, note="login")
+        state["credits"] = out.credits
+        state["plan"] = out.plan
+        state["detail"] = out.credits_detail
+        if out.deep_link:
+            return dispatch_deep_link(out.deep_link)
+        return True
+
+    return _ui, state

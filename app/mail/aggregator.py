@@ -57,6 +57,20 @@ class MailAggregator:
         return out[:n]
 
     # ---- 收信 -------------------------------------------------------------
+    def wait_for_mail(
+        self,
+        ident: MailIdentity,
+        timeout: int = 600,
+        match: Callable[[MailMessage], bool] | None = None,
+        poll_interval: int = 8,
+    ) -> MailMessage | None:
+        """按地址所属 provider 转发，等待匹配邮件（otp_source 取码入口）。"""
+        provider = self.providers.get(ident.provider)
+        if provider is None:
+            raise KeyError(f"未知邮件源：{ident.provider}")
+        return provider.wait_for_mail(
+            ident, timeout=timeout, match=match, poll_interval=poll_interval)
+
     def wait_confirm(
         self,
         ident: MailIdentity,

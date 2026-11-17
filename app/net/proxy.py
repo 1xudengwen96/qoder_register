@@ -398,6 +398,141 @@ def _same_region(proxy: Proxy, region: str | None) -> bool:
     return (proxy.region or "").lower() == region.lower()
 
 
+def _proxy_country(proxy: Proxy, timeout: int = 10) -> str:
+    """走代理查出口国家码（2 字母，如 SG/US）。失败返回空串。"""
+    import requests
+
+    try:
+        r = requests.get(
+            "http://ip-api.com/json/?fields=countryCode",
+            proxies={"http": proxy.raw, "https": proxy.raw},
+            timeout=timeout,
+        )
+        cc = (r.json().get("countryCode") or "").upper()
+        return cc
+    except Exception:
+        return ""
+
+
+def acquire_for_browser(cfg, region: str = "sg",
+                        ip_file: str = "data/ip.txt",
+                        max_tries: int = 5) -> Proxy | None:
+    """指纹浏览器代理获取（新逻辑，2026-11-17 按用户设计修订）。
+
+    优先级：
+    1. 读 ``ip_file``（每行 ``ip:port:user:password``，无 scheme）：
+       取第一条可解析行即**消耗掉**——原子地从文件删行（一个窗口用掉就不再用），
+       并追加记录到同目录 ``ip_used.txt`` 备查；行不做国家校验，质量由清单维护者保证。
+    2. 文件不存在 / 空白 / 无可解析行 → 用 ipdeep ``extract_url``/网关凭证提取，
+       **只允许 us / sg** 两个地区（2026-11-17 实测 hk 段被阿里风控打低信誉分，
+       滑块连续 6+ 次"無法驗證使用者是否為人類"，弃用），出口国家必须与
+       region 一致，不符就丢弃重取。
+
+    实测 extract_url 后台配置不保证国家（曾出过 Belarus IP 导致 aliyun 滑块图
+    全部拒绝下载），所以校验不可省。最多重取 ``max_tries`` 次。
+    """
+    region = (region or "").lower()
+    if region not in ("us", "sg"):
+        return None
+    want_cc = region.upper()
+
+    # 1) ip.txt：消耗式取用（取一行删一行，用完即止）
+    p = Path(ip_file)
+    if p.exists():
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            pick = -1
+            px = None
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if not s or s.startswith(("#", ";", "//")):
+                    continue
+                cand = parse_line(s)
+                if cand:
+                    pick, px = i, cand
+                    break
+            if px is not None:
+                rest = [ln for j, ln in enumerate(lines) if j != pick]
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                tmp.write_text("\n".join(rest) + ("\n" if rest else ""),
+                               encoding="utf-8")
+                tmp.replace(p)          # 原子替换，避免读到半截文件
+                used = p.parent / "ip_used.txt"
+                try:
+                    with open(used, "a", encoding="utf-8") as fh:
+                        fh.write(px.raw + "\n")
+                except Exception:
+                    pass                # 审计记录失败不影响主流程
+                return px
+        except Exception:
+            pass
+
+    # 2) ipdeep 兜底：底座凭证固定（gate.ipdeep.com:8080 + 账号段:密码），
+    #    出口国家由用户名里的 ``-country-{cc}-`` 段控制，代码构造 + 校验，
+    #    cc 只允许 us/sg（hk 段 IP 信誉差已弃用）。
+    #    实测 extract_url 后台不锁国家（出过 Belarus/MY/SY）且有提取限流，
+    #    所以凭证优先读 secrets.yaml 的 ipdeep.gate_*，缺失才从 extract_url 探测。
+    base_host = base_port = base_user = base_pass = ""
+    try:
+        from app import secrets as _sec
+        base_host = _sec.get("ipdeep.gate_host") or ""
+        base_port = _sec.get("ipdeep.gate_port") or 8080
+        base_user = _sec.get("ipdeep.gate_user") or ""
+        base_pass = _sec.get("ipdeep.gate_pass") or ""
+    except Exception:
+        pass
+
+    if not (base_host and base_user):
+        extract_url = ""
+        try:
+            from app import secrets as _sec
+            extract_url = _sec.get("ipdeep.extract_url") or ""
+        except Exception:
+            extract_url = ""
+        if extract_url:
+            import urllib.request
+
+            try:
+                r = urllib.request.urlopen(extract_url, timeout=15)
+                text = r.read().decode("utf-8", "replace").strip()
+            except Exception:
+                text = ""
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", ";", "//")):
+                    continue
+                px = parse_line(line)
+                if px:
+                    base_host, base_port = px.host, px.port
+                    base_user, base_pass = px.username or "", px.password or ""
+                    break
+
+    if not (base_host and base_user):
+        return None
+
+    # 构造 country-{region} 网关用户名：把 session 段替换为带国家段的版本
+    import random
+    import re as _re
+
+    for _ in range(max_tries):
+        sess = random.randint(1_000_000, 99_999_999)
+        user = base_user
+        m = _re.search(r"-session-(\d+)", user)
+        if m:
+            user = user[:m.start()] + f"-country-{region}-session-{sess}" + \
+                user[m.end():]
+        else:
+            user = f"{user}-country-{region}-session-{sess}"
+        raw = f"http://{user}:{base_pass}@{base_host}:{base_port}"
+        px = parse_line(raw)
+        if not px:
+            continue
+        cc = _proxy_country(px)
+        if cc == want_cc:
+            return px
+    return None
+
+
 def acquire_once(pool: "ProxyPool", ledger: ProxyLedger,
                  region: str | None = None, check: bool = False,
                  timeout: int = 10) -> Proxy | None:

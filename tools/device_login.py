@@ -37,6 +37,8 @@ def clipboard() -> str:
 
 def save_client_token(email: str, token, db_id: int | None = None) -> None:
     """把 machine_token 落库（token_json 换来源）。"""
+    import datetime as dt
+
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import sessionmaker
 
@@ -48,7 +50,7 @@ def save_client_token(email: str, token, db_id: int | None = None) -> None:
         "device_id": token.device_id,
         "token_type": token.token_type,
         "source": token.source,
-        "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "captured_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     engine = create_engine(f"sqlite:///{ROOT / 'data' / 'qoder.db'}")
     Base.metadata.create_all(engine)
@@ -62,7 +64,7 @@ def save_client_token(email: str, token, db_id: int | None = None) -> None:
         state = getattr(AccountState, "CLAIMED", None)
         if state is not None:
             row.state = state
-        row.claimed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        row.claimed_at = dt.datetime.now()
         s.commit()
         print(f"已写入 account#{row.id} token_json（客户端 token）")
 

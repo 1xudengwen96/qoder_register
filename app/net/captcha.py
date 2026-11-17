@@ -1,9 +1,7 @@
-"""打码平台封装：YesCaptcha / 2Captcha。
+"""打码客户端封装：只用 2Captcha（2026-11-17 决策）。
 
 只做两件事：提交任务、轮询结果。计费累加在实例上，供 stats 展示单号成本。
-API 文档索引：
-  - YesCaptcha: https://yescaptcha.atlassian.net/wiki/spaces/API/
-  - 2Captcha:   https://2captcha.com/2captcha-api
+API 文档：https://2captcha.com/2captcha-api
 """
 
 from __future__ import annotations
@@ -19,75 +17,18 @@ class CaptchaError(RuntimeError):
 
 
 class CaptchaClient:
-    YESCAPTCHA_CREATE = "https://api.yescaptcha.com/createTask"
-    YESCAPTCHA_RESULT = "https://api.yescaptcha.com/getTaskResult"
     TWOCAPTCHA_IN = "https://2captcha.com/in.php"
     TWOCAPTCHA_RES = "https://2captcha.com/res.php"
 
-    def __init__(self, provider: str, api_key: str, timeout: int = 180) -> None:
-        self.provider = provider.lower()
+    def __init__(self, provider: str = "2captcha", api_key: str = "",
+                 timeout: int = 180) -> None:
+        self.provider = "2captcha" if (provider or "").lower() in (
+            "", "2captcha", "twocaptcha") else provider.lower()
         self.api_key = api_key
         self.timeout = timeout
         self.spent = 0.0          # 累计花费（元）
         self.solved = 0
         self.failed = 0
-
-    # ---- YesCaptcha -------------------------------------------------------
-    def solve_recaptcha_v2_yescaptcha(self, site_key: str, page_url: str,
-                                     proxy: str | None = None) -> str:
-        payload: dict[str, Any] = {
-            "clientKey": self.api_key,
-            "task": {
-                "type": "NoCaptchaTaskProxyless",
-                "websiteURL": page_url,
-                "websiteKey": site_key,
-            },
-        }
-        if proxy:
-            payload["task"] = {
-                "type": "NoCaptchaTask",
-                "websiteURL": page_url,
-                "websiteKey": site_key,
-                "proxyType": "http",
-                "proxyAddress": proxy.split("://")[-1].split(":")[0],
-                "proxyPort": int(proxy.rsplit(":", 1)[-1]),
-            }
-        task_id = self._yc_create(payload)
-        return self._yc_wait(task_id)
-
-    def solve_image_yescaptcha(self, b64_image: str) -> str:
-        payload = {
-            "clientKey": self.api_key,
-            "task": {"type": "ImageToTextTask", "body": b64_image},
-        }
-        task_id = self._yc_create(payload)
-        return self._yc_wait(task_id, text_mode=True)
-
-    def _yc_create(self, payload: dict) -> str:
-        r = requests.post(self.YESCAPTCHA_CREATE, json=payload, timeout=30)
-        data = r.json()
-        if data.get("errorId", 1) != 0:
-            self.failed += 1
-            raise CaptchaError(f"YesCaptcha 建任务失败：{data}")
-        return str(data["taskId"])
-
-    def _yc_wait(self, task_id: str, text_mode: bool = False) -> str:
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            r = requests.post(
-                self.YESCAPTCHA_RESULT,
-                json={"clientKey": self.api_key, "taskId": task_id},
-                timeout=30,
-            )
-            data = r.json()
-            if data.get("status") == "ready":
-                self.solved += 1
-                self.spent += 0.0015 if text_mode else 0.003
-                sol = data["solution"]
-                return sol.get("gRecaptchaResponse") or sol.get("text") or ""
-            time.sleep(4)
-        self.failed += 1
-        raise CaptchaError("YesCaptcha 超时")
 
     # ---- 2Captcha ---------------------------------------------------------
     def solve_recaptcha_v2_2captcha(self, site_key: str, page_url: str) -> str:
@@ -123,17 +64,13 @@ class CaptchaClient:
 
     # ---- 统一入口 ---------------------------------------------------------
     def solve(self, kind: str, **kwargs) -> str:
-        if self.provider == "yescaptcha":
-            if kind == "recaptcha_v2":
-                return self.solve_recaptcha_v2_yescaptcha(
-                    kwargs["site_key"], kwargs["page_url"], kwargs.get("proxy")
-                )
-            if kind == "image":
-                return self.solve_image_yescaptcha(kwargs["b64_image"])
-        elif self.provider == "2captcha":
-            if kind == "recaptcha_v2":
-                return self.solve_recaptcha_v2_2captcha(kwargs["site_key"], kwargs["page_url"])
-        raise CaptchaError(f"不支持的组合：{self.provider}/{kind}")
+        if self.provider != "2captcha":
+            raise CaptchaError(
+                f"不支持的供应商：{self.provider}（只支持 2captcha）")
+        if kind == "recaptcha_v2":
+            return self.solve_recaptcha_v2_2captcha(
+                kwargs["site_key"], kwargs["page_url"])
+        raise CaptchaError(f"不支持的任务类型：{kind}")
 
     def cost_summary(self) -> str:
         return f"打码 {self.solved} 次，花费 ¥{self.spent:.4f}，失败 {self.failed}"

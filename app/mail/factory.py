@@ -13,12 +13,19 @@ from app.mail.outlook import OutlookTagProvider
 
 
 def taken_addresses(db) -> set[str]:
-    """已用过 / 已退役的地址集合，防止重复取到。"""
-    from app.models import MailIdentity as MailRow
+    """已用过 / 已退役 / 已分配（pending）的地址集合，防止重复取到。
+
+    POOL 状态的地址还在池里可用，不算 taken。
+    """
+    from app.models import MailIdentity as MailRow, MailStatus
 
     s = db.get_session()
     try:
-        return {row.address.lower() for row in s.query(MailRow).all()}
+        return {
+            row.address.lower()
+            for row in s.query(MailRow)
+            .filter(MailRow.status != MailStatus.POOL).all()
+        }
     finally:
         s.close()
 
@@ -80,6 +87,16 @@ def build_mail_layer(cfg, db) -> MailAggregator:
             rules=RelayMatchRules.from_config(rules_raw
                                              if isinstance(rules_raw, dict) else {}),
         )
+
+    # mail.provider：明确指定只用哪个邮件源（如 icloud_relay）；留空＝按 strategy 自动。
+    # 指定的源若没构建出来（配置缺失/文件不存在）直接报错，不允许静默回落。
+    only = str(get(cfg, "mail.provider", "") or "").strip()
+    if only:
+        if only not in providers:
+            raise ValueError(
+                f"mail.provider={only!r} 未配置或不可用，可用源: "
+                f"{sorted(providers) or '无'}")
+        providers = {only: providers[only]}
 
     strategy = get(cfg, "mail.strategy", "weighted")
     weights_raw = to_plain(get(cfg, "mail.weights", {}) or {})

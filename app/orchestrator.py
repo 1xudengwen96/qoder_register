@@ -103,7 +103,7 @@ class Pipeline:
                              "http://127.0.0.1:54345"),
                 group_id=(get(cfg, "browser.bitbrowser.group_id", "") or None),
                 env_id=get(cfg, "browser.bitbrowser.env_id", "") or "",
-                reuse_env=bool(get(cfg, "browser.bitbrowser.reuse_env", True)),
+                reuse_env=bool(get(cfg, "browser.bitbrowser.reuse_env", False)),
                 signup_url=get(cfg, "register.cdp_signup_url",
                                "https://qoder.com/users/sign-up"),
                 artifacts_dir=get(cfg, "storage.artifacts_dir", "data/artifacts"),
@@ -125,12 +125,18 @@ class Pipeline:
             app_dir=get(cfg, "device.app_dir", None),
             backup_dir=get(cfg, "device.backup_dir", "data/device_backup"),
         )
+        # 领取登录模式：inherit（默认，继承已有登录态，无人值守）/ cdp
+        # （半自动：人点一次客户端「登录」，拿链接之后 wait_link →
+        # drive_login → 回跳全自动，见 ``_claim_ui_login``）
+        self.claim_login_mode = str(
+            get(cfg, "claim.login_mode", "inherit") or "inherit").strip().lower()
         self.claimer = Claimer(
             client_path=get(cfg, "claim.client_path", ""),
             account_data_dir=get(cfg, "claim.data_dir", ""),
             wait_credit_timeout=int(get(cfg, "claim.wait_credit_timeout", 120)),
             capture_token=bool(get(cfg, "claim.capture_token", True)),
             credit_probe_url=get(cfg, "claim.credit_probe_url", None),
+            login_mode="cdp" if self.claim_login_mode == "cdp" else "inherit",
         )
 
     # ------------------------------------------------------------ 事件
@@ -173,11 +179,20 @@ class Pipeline:
     def _acquire_proxy(self, region: str | None = None, env_tag: str = "") -> object | None:
         """给这次开窗口取**一条没用过**的代理；池子空了就按模板续期。
 
-        ipdeep 这类按 session 计费的代理商：一条会话 = 一个出口 IP，粘性 5 分钟。
-        所以每条只能用一次，用完留在账本里作废，下一轮换新的。
+        新逻辑（优先）：``data/ip.txt``（ip:port:user:password）→ ipdeep extract_url
+        兜底；region 只允许 sg/us。详见 ``proxy.acquire_for_browser``。
+        拿不到再走原来的 ProxyPool + acquire_once 链路。
         """
-        from app.net.proxy import acquire_once
+        from app.net.proxy import acquire_for_browser, acquire_once
 
+        # ① 新逻辑：ip.txt（消耗式）→ ipdeep 兜底（只 us/sg）
+        px = acquire_for_browser(self.cfg, region=region or "sg")
+        if px is not None:
+            if env_tag:
+                self.ledger.mark(px, env=env_tag, note="in-use")
+            return px
+
+        # ② 旧逻辑兜底
         if not bool(get(self.cfg, "proxy.one_shot", True)):
             return self.proxies.acquire(region=region)
 
@@ -246,6 +261,75 @@ class Pipeline:
             if src is not None:
                 src.close()
 
+    # ------------------------------------------------------------ 设备画像
+    def _device_profile_for(self, account_id: int, region: str):
+        """设备身份画像（browser 匹配模式）。
+
+        注册段的比特浏览器画像是 ``make_profile(region, seed=acct{id})``（确定性），
+        领取段用同一 seed 重建后派生设备身份 → 平台/时区/语言/CPU/内存/GPU/分辨率
+        与注册环境完全一致。``device.identity_mode`` 不设或非 browser 时返回 None，
+        走原随机方案。
+        """
+        mode = str(get(self.cfg, "device.identity_mode", "") or "").strip().lower()
+        if mode not in ("browser", "match", "fingerprint_browser"):
+            return None
+        try:
+            from app.device.identity_profile import profile_from_browser
+            from app.register.fingerprint_engine import make_profile
+
+            bfp = make_profile(region=region, seed=f"acct{account_id}")
+            return profile_from_browser(bfp)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("浏览器匹配画像构建失败，退回原随机方案：%s", exc)
+            return None
+
+    # ------------------------------------------------------------ 领取登录
+    def _claim_ui_login(self, email_addr: str, password: str, account_id: int):
+        """领取段的登录动作，返回 (回调, state)。
+
+        默认（``claim.login_mode`` 不设 / inherit）返回 ``(None, {})``：走
+        继承模式，perform 里只等 token 变化——但设备重置已清空登录态、
+        客户端停在登录界面，这条路在全自动链路上等不到新 token，等于把
+        领取留给人工补跑。配置 ``claim.login_mode: cdp`` 改走半自动：
+        人点一次客户端「登录」，之后 wait_link → drive_login → 回跳全自动。
+        """
+        if self.claim_login_mode not in ("cdp", "ui", "manual"):
+            return None, {}
+        try:
+            from app.claim.ui_login import make_ui_login
+
+            ui, state = make_ui_login(
+                self.cfg, email_addr, password,
+                # 一一对应：复用注册环境 acct{id}（同指纹/代理/IP，注册
+                # cookie 还在，selectAccounts 免密授权），不再另建 login 环境
+                env_name=f"acct{account_id}",
+                region=get(self.cfg, "region", "us"),
+                link_timeout=int(get(self.cfg, "claim.link_timeout", 180)),
+                login_timeout=int(get(self.cfg, "claim.login_timeout", 300)),
+                artifacts_dir=get(self.cfg, "storage.artifacts_dir", "data/artifacts"),
+            )
+            return ui, state
+        except Exception as exc:  # noqa: BLE001
+            log.warning("半自动登录回调构建失败，退回继承模式：%s", exc)
+            return None, {}
+
+    def _claim_with_fallback(self, email_addr: str, password: str, account_id: int):
+        """perform + 额度兜底（登录会话额度 → 账号页重读），claim_only/_run_one 共用。"""
+        from app.claim.claimer import apply_credits_fallback
+
+        ui, login_state = self._claim_ui_login(email_addr, password, account_id)
+        cres = self.claimer.perform(email_addr, password, ui_login=ui)
+        if cres.ok and cres.credits <= 0:
+            src = apply_credits_fallback(
+                cres, login_state, self.cfg,
+                env_name=f"acct{account_id}",
+                region=get(self.cfg, "region", "us"),
+            )
+            if src and cres.credits > 0:
+                log.info("额度兜底命中（%s）：credits=%d plan=%s",
+                         src, cres.credits, cres.plan)
+        return cres
+
     # ------------------------------------------------------------ 分段执行
     def register_only(self, region: str | None = None, worker: int = 0) -> RunReport:
         """只做注册 + 验证，不碰设备、不碰客户端。可并发跑多个 worker。
@@ -261,10 +345,18 @@ class Pipeline:
         ident = idents[0]
 
         with session_scope() as s:
-            mail_row = MailRow(provider=ident.provider, address=ident.address,
-                               parent_account=ident.parent_account,
-                               status=MailStatus.PENDING)
-            s.add(mail_row)
+            # mail:import 可能已把地址以 POOL 状态导入，先查再 update/insert
+            mail_row = s.query(MailRow).filter(
+                MailRow.address == ident.address).one_or_none()
+            if mail_row is None:
+                mail_row = MailRow(provider=ident.provider, address=ident.address,
+                                   parent_account=ident.parent_account,
+                                   status=MailStatus.PENDING)
+                s.add(mail_row)
+            else:
+                mail_row.status = MailStatus.PENDING
+                if ident.parent_account and not mail_row.parent_account:
+                    mail_row.parent_account = ident.parent_account
             s.flush()
             acct = Account(email=ident.address, password=strong_password(),
                            username=random_username(), state=AccountState.NEW)
@@ -342,6 +434,9 @@ class Pipeline:
         tz = get(self.cfg, f"region_profiles.{region}.timezone", "America/New_York")
 
         # 设备重置（全局状态，不能并发）
+        identity = self._device_profile_for(account_id, region)
+        if identity is not None:
+            log.info("设备身份=浏览器匹配画像 %s", identity.brief())
         rres = self.resetter.run(ResetOptions(
             steps=tuple(ALL_STEPS),
             dry_run=False,
@@ -349,6 +444,7 @@ class Pipeline:
             fake_hardware=bool(get(self.cfg, "device.fake_hardware", False)),
             timezone=tz,
             locale=get(self.cfg, f"region_profiles.{region}.locale", "en-US"),
+            profile=identity,
         ))
         if device_lock:
             device_lock.refresh()
@@ -373,7 +469,7 @@ class Pipeline:
         if device_lock:
             device_lock.refresh()
 
-        cres = self.claimer.perform(email_addr, password)
+        cres = self._claim_with_fallback(email_addr, password, account_id)
         if not cres.ok:
             self._release(prof_id)
             self._fail(account_id, "claim", cres.error)
@@ -420,17 +516,38 @@ class Pipeline:
         region = (region or get(self.cfg, "region", "us")).lower()
         tz = get(self.cfg, f"region_profiles.{region}.timezone", "America/New_York")
 
-        # ① 邮箱
-        idents = self.mail_layer.acquire(1)
-        if not idents:
-            return RunReport(False, stage="mail", message="邮箱池已空")
-        ident = idents[0]
-
+        # ① 邮箱（跳过已建过账号的地址：mail_identity 可能回 POOL，
+        #    但同邮箱在 account 表已存在（如昨天 CLAIMED 的），直接 insert 会撞唯一约束）
+        ident = None
         with session_scope() as s:
-            mail_row = MailRow(provider=ident.provider, address=ident.address,
-                               parent_account=ident.parent_account,
-                               status=MailStatus.PENDING)
-            s.add(mail_row)
+            for _ in range(3):
+                idents = self.mail_layer.acquire(1)
+                if not idents:
+                    break
+                cand = idents[0]
+                if s.query(Account).filter(
+                        Account.email == cand.address).one_or_none() is None:
+                    ident = cand
+                    break
+                row = s.query(MailRow).filter(
+                    MailRow.address == cand.address).one_or_none()
+                if row is not None and row.status == MailStatus.POOL:
+                    row.status = MailStatus.USED
+                s.flush()
+            if ident is None:
+                return RunReport(False, stage="mail", message="邮箱池已空/无新地址")
+
+            mail_row = s.query(MailRow).filter(
+                MailRow.address == ident.address).one_or_none()
+            if mail_row is None:
+                mail_row = MailRow(provider=ident.provider, address=ident.address,
+                                   parent_account=ident.parent_account,
+                                   status=MailStatus.PENDING)
+                s.add(mail_row)
+            else:
+                mail_row.status = MailStatus.PENDING
+                if ident.parent_account and not mail_row.parent_account:
+                    mail_row.parent_account = ident.parent_account
             s.flush()
             acct = Account(email=ident.address, password=strong_password(),
                            username=random_username(), state=AccountState.NEW)
@@ -499,6 +616,9 @@ class Pipeline:
         self._event(account_id, "verify", "info", "邮箱验证通过", verify_detail)
 
         # ⑤ 设备重置（qoder-free 改造版，全量 9 步）
+        identity = self._device_profile_for(account_id, region)
+        if identity is not None:
+            log.info("设备身份=浏览器匹配画像 %s", identity.brief())
         rres = self.resetter.run(ResetOptions(
             steps=tuple(ALL_STEPS),
             dry_run=dry_run_device,
@@ -506,6 +626,7 @@ class Pipeline:
             fake_hardware=bool(get(self.cfg, "device.fake_hardware", False)),
             timezone=tz,
             locale=get(self.cfg, f"region_profiles.{region}.locale", "en-US"),
+            profile=identity,
         ))
         with session_scope() as s:
             prof = DeviceProfile(
@@ -525,8 +646,8 @@ class Pipeline:
                     f"设备重置 {'成功' if rres.ok else '有异常'}，动作 {len(rres.actions)} 项",
                     {"errors": rres.errors[:10], "backup": rres.backup_dir})
 
-        # ⑥ 领取
-        cres = self.claimer.perform(email_addr, password)
+        # ⑥ 领取（claim.login_mode=cdp 时半自动：人点一次客户端「登录」）
+        cres = self._claim_with_fallback(email_addr, password, account_id)
         if not cres.ok:
             self._release(prof_id)
             self._fail(account_id, "claim", cres.error)

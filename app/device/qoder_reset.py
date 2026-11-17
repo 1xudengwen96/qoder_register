@@ -176,6 +176,10 @@ class ResetOptions:
     timezone: str = "America/New_York"    # 应与代理地区对齐
     locale: str = "en-US"
     backup: bool = True
+    # 设备身份画像（app.device.identity_profile）。None = 原随机方案（不动）；
+    # 传入画像 → machineid/telemetry/system/硬件 JSON 全部改用画像值，
+    # 指纹浏览器式「同 seed 同设备」。
+    profile: object | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -212,13 +216,21 @@ class QoderIdentityReset:
     # ---------------------------------------------------------- 路径
     @staticmethod
     def default_app_dir() -> Path:
-        """原仓库 get_qoder_data_dir 的等价实现 + 多候选探测。"""
+        """原仓库 get_qoder_data_dir 的等价实现 + 多候选探测。
+
+        Qoder 0.4.x 起数据目录从 ``%APPDATA%\\Qoder`` 改成
+        ``%APPDATA%\\com.qoder.app.stable``，优先认新路径；旧路径向后兼容。
+        """
         home = Path.home()
         system = platform.system()
         if system == "Windows":
+            appdata = Path(os.environ.get("APPDATA", home / "AppData/Roaming"))
             candidates = [
-                Path(os.environ.get("APPDATA", home / "AppData/Roaming")) / "Qoder",
-                Path(os.environ.get("LOCALAPPDATA", home / "AppData/Local")) / "Qoder",
+                appdata / "com.qoder.app.stable",   # 0.4.x+
+                appdata / "com.qodercn.app.stable", # 国内版 0.4.x+
+                appdata / "Qoder",                   # 0.3.x 旧布局
+                Path(os.environ.get("LOCALAPPDATA",
+                                     home / "AppData/Local")) / "Qoder",
             ]
         elif system == "Darwin":
             candidates = [home / "Library" / "Application Support" / "Qoder"]
@@ -232,16 +244,36 @@ class QoderIdentityReset:
                 return c
         return candidates[0]
 
+    # ------------------------------------------------------------ 数据目录布局
+    # 0.3.x：app_dir/User/globalStorage/storage.json（VS Code 系布局）
+    # 0.4.x：app_dir/auth.v1.dat + auth.machine-id（平铺 Electron 布局）
+    # 这些属性按实际文件存在情况返回；不存在返回 None。
     @property
-    def storage_json(self) -> Path:
-        return self.app_dir / "User" / "globalStorage" / "storage.json"
+    def storage_json(self) -> Path | None:
+        """0.3.x 风格的 storage.json；0.4.x 不存在。"""
+        p = self.app_dir / "User" / "globalStorage" / "storage.json"
+        return p if p.exists() else None
 
     @property
-    def settings_json(self) -> Path:
-        return self.app_dir / "User" / "settings.json"
+    def settings_json(self) -> Path | None:
+        p = self.app_dir / "User" / "settings.json"
+        return p if p.exists() else None
+
+    @property
+    def auth_dat(self) -> Path | None:
+        """0.4.x 设备授权 + token 文件（DPAPI 加密）。"""
+        p = self.app_dir / "auth.v1.dat"
+        return p if p.exists() else None
 
     # ---------------------------------------------------------- 进程
     def is_running(self) -> tuple[bool, list[str]]:
+        """探测 Qoder 客户端是否在跑。返回 (running, pids)。
+
+        注意：Windows 中文系统 ``tasklist`` 输出是 GBK 编码，``text=True``
+        默认 utf-8 解码会爆 ``UnicodeDecodeError`` 让 stdout 变 None，
+        从而误报"未运行"。必须显式 ``encoding='gbk', errors='replace'``。
+        PID 在 CSV 第 2 列（第 1 列是映像名）。
+        """
         pids: list[str] = []
         system = platform.system()
         if system == "Windows":
@@ -249,11 +281,15 @@ class QoderIdentityReset:
                 out = subprocess.run(
                     ["tasklist", "/FO", "CSV", "/NH"],
                     capture_output=True, text=True, timeout=20,
+                    encoding="gbk", errors="replace",
                 )
-                for line in out.stdout.splitlines():
-                    name = line.split(",")[0].strip('"')
+                for line in (out.stdout or "").splitlines():
+                    parts = line.split(",")
+                    if len(parts) < 2:
+                        continue
+                    name = parts[0].strip('"')
                     if name.lower().startswith("qoder"):
-                        pids.append(name)
+                        pids.append(parts[1].strip('"'))
             except Exception:
                 pass
         else:
@@ -377,8 +413,8 @@ class QoderIdentityReset:
         except Exception as exc:
             report.errors.append(f"写入失败 {label}: {exc}")
 
-    def _load_json(self, p: Path) -> dict:
-        if not p.exists():
+    def _load_json(self, p: Path | None) -> dict:
+        if p is None or not p.exists():
             return {}
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
@@ -392,6 +428,9 @@ class QoderIdentityReset:
 
     # ---------------------------------------------------------- 系统指纹
     def _system_fingerprint(self, opts: ResetOptions) -> dict:
+        if opts.profile is not None:
+            # 画像模式：system.* 全套来自设备画像（时区/语言与注册浏览器画像一致）
+            return dict(opts.profile.system)
         system = opts.platform_hint or platform.system()
         if system == "Darwin":
             version = f"{random.choice([12, 13, 14, 15])}.{random.randint(0, 6)}.{random.randint(0, 9)}"
@@ -416,11 +455,19 @@ class QoderIdentityReset:
 
     # ---------------------------------------------------------- 各步骤
     def step_machine_id(self, opts: ResetOptions, report: ResetReport) -> None:
-        new_main = self._gen_uuid()
+        if opts.profile is not None:
+            new_main = opts.profile.machine_id
+            file_vals = {name: (new_main if name == "machineid"
+                                else opts.profile.id_file_ids.get(name, new_main))
+                         for name in ID_FILES}
+        else:
+            new_main = self._gen_uuid()
+            file_vals = {name: (new_main if name == "machineid"
+                                else self._gen_uuid())
+                         for name in ID_FILES}
         report.machine_id = new_main
-        for name in ID_FILES:
-            self._write(self.app_dir / name, new_main if name == "machineid" else self._gen_uuid(),
-                        opts, report)
+        for name, val in file_vals.items():
+            self._write(self.app_dir / name, val, opts, report)
         # storage.json 同步（原仓库逻辑：machineId 存 sha256）
         data = self._load_json(self.storage_json)
         if data:
@@ -435,10 +482,16 @@ class QoderIdentityReset:
         if not data:
             report.actions.append("telemetry: storage.json 不存在，跳过（首启会重建）")
             return
-        for key, kind in TELEMETRY_KEYS.items():
-            val = self._gen(kind)
-            data[key] = val
-            report.telemetry[key] = val
+        if opts.profile is not None:
+            # 画像模式：telemetry 全套确定性值，同一设备跨重置不漂移
+            for key, val in opts.profile.telemetry.items():
+                data[key] = val
+                report.telemetry[key] = val
+        else:
+            for key, kind in TELEMETRY_KEYS.items():
+                val = self._gen(kind)
+                data[key] = val
+                report.telemetry[key] = val
         data.update(self._system_fingerprint(opts))
         self._dump_json(self.storage_json, data, opts, report)
 
@@ -486,6 +539,7 @@ class QoderIdentityReset:
         for name in sessions:
             self._rm(self.app_dir / name, opts, report)
 
+        # 0.3.x：清除 storage.json 里的身份键
         data = self._load_json(self.storage_json)
         if data:
             removed = [k for k in list(data) if any(w in k.lower() for w in IDENTITY_KEYWORDS)]
@@ -495,15 +549,34 @@ class QoderIdentityReset:
                 report.actions.append(f"login: 清除 storage.json 中 {len(removed)} 个身份键")
                 self._dump_json(self.storage_json, data, opts, report)
 
+        # 0.4.x：清除 auth.v1.dat（设备授权 + token）、auth.machine-id
+        # 这些是 0.4.x 设备绑定真正落点；不清下次启动客户端会自动续上原账号。
+        for name in ("auth.v1.dat", "auth.machine-id"):
+            p = self.app_dir / name
+            if p.exists():
+                self._rm(p, opts, report)
+                report.actions.append(f"login: 清除 {name}")
+
     def step_hardware(self, opts: ResetOptions, report: ResetReport) -> None:
-        for name in ID_FILES:
-            self._write(self.app_dir / name, self._gen_uuid(), opts, report)
+        if opts.profile is not None:
+            for name in ID_FILES:
+                self._write(self.app_dir / name,
+                            opts.profile.id_file_ids.get(name,
+                                                         opts.profile.machine_id),
+                            opts, report)
+        else:
+            for name in ID_FILES:
+                self._write(self.app_dir / name, self._gen_uuid(), opts, report)
         for name in HARDWARE_CACHE_DIRS:
             self._rm(self.app_dir / name, opts, report)
         data = self._load_json(self.storage_json)
         if data:
-            for key in list(TELEMETRY_KEYS):
-                data[key] = self._gen(TELEMETRY_KEYS[key])
+            if opts.profile is not None:
+                for key, val in opts.profile.telemetry.items():
+                    data[key] = val
+            else:
+                for key in list(TELEMETRY_KEYS):
+                    data[key] = self._gen(TELEMETRY_KEYS[key])
             data.update(self._system_fingerprint(opts))
             for key in list(data):
                 if any(w in key.lower() for w in ("hardware", "cpu", "gpu",
@@ -537,6 +610,9 @@ class QoderIdentityReset:
     # ---------------------------------------------------------- 假硬件画像
     @staticmethod
     def _fake_hardware_profile(opts: ResetOptions) -> dict:
+        if opts.profile is not None:
+            # 画像模式：硬件 JSON 来自设备画像（与浏览器画像的 GPU/核数/内存对齐）
+            return opts.profile.hardware
         system = opts.platform_hint or platform.system()
         if system == "Darwin":
             n = random.randint(2, 5)
@@ -577,24 +653,28 @@ class QoderIdentityReset:
         注意：这层只影响 **Qoder 客户端内置浏览器** 的痕迹，不替代注册阶段用的
         指纹浏览器。注册阶段的指纹走 fingerprint_engine 模块。
         """
-        ua_pool = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        ]
-        fp = {
-            "user_agent": random.choice(ua_pool),
-            "screen_resolution": random.choice(["1920x1080", "2560x1440", "3840x2160", "1366x768"]),
-            "color_depth": random.choice([24, 32]),
-            "timezone": opts.timezone,
-            "language": opts.locale,
-            "platform": {"Windows": "Win32", "Darwin": "MacIntel"}.get(
-                opts.platform_hint or platform.system(), "Linux x86_64"),
-            "webgl_vendor": random.choice(
-                ["Google Inc. (NVIDIA)", "Google Inc. (Intel)", "Google Inc. (Apple)"]),
-            "canvas_fingerprint": hashlib.md5(str(random.random()).encode()).hexdigest()[:16],
-            "audio_fingerprint": hashlib.md5(str(random.random()).encode()).hexdigest()[:16],
-        }
+        if opts.profile is not None:
+            # 画像模式：内置浏览器指纹与注册段浏览器画像同源（UA/分辨率/时区/GPU）
+            fp = dict(opts.profile.browser_fp)
+        else:
+            ua_pool = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            ]
+            fp = {
+                "user_agent": random.choice(ua_pool),
+                "screen_resolution": random.choice(["1920x1080", "2560x1440", "3840x2160", "1366x768"]),
+                "color_depth": random.choice([24, 32]),
+                "timezone": opts.timezone,
+                "language": opts.locale,
+                "platform": {"Windows": "Win32", "Darwin": "MacIntel"}.get(
+                    opts.platform_hint or platform.system(), "Linux x86_64"),
+                "webgl_vendor": random.choice(
+                    ["Google Inc. (NVIDIA)", "Google Inc. (Intel)", "Google Inc. (Apple)"]),
+                "canvas_fingerprint": hashlib.md5(str(random.random()).encode()).hexdigest()[:16],
+                "audio_fingerprint": hashlib.md5(str(random.random()).encode()).hexdigest()[:16],
+            }
         for name in BROWSER_FP_FILES:
             self._write(self.app_dir / name,
                         json.dumps(fp, indent=2, ensure_ascii=False), opts, report)
@@ -626,8 +706,10 @@ class QoderIdentityReset:
             p = self.app_dir / name
             if p.exists():
                 snapshot_targets.append(p)
-        if self.storage_json.exists():
+        if self.storage_json is not None:
             snapshot_targets.append(self.storage_json)
+        if self.auth_dat is not None:
+            snapshot_targets.append(self.auth_dat)
         self._snapshot(snapshot_targets, opts, report)
 
         step_map = {

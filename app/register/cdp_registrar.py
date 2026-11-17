@@ -75,7 +75,7 @@ class CDPRegistrar:
         api_base: str = "http://127.0.0.1:54345",
         group_id: str | None = None,
         env_id: str = "",
-        reuse_env: bool = True,
+        reuse_env: bool = False,
         signup_url: str = "https://qoder.com/users/sign-up",
         artifacts_dir: str | Path = "data/artifacts",
         captcha_max_attempts: int = 6,

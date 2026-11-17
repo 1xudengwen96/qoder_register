@@ -41,7 +41,6 @@ def check_deps() -> None:
         "yaml": "配置解析",
         "requests": "HTTP",
         "playwright": "浏览器自动化",
-        "ddddocr": "本地 OCR",
     }
     optional = {
         "pywinauto": "Windows 客户端 UI 自动化（领取阶段可能用到）",
@@ -263,9 +262,20 @@ def check_stubs() -> None:
     add("桩位", "领取阶段额度接口", STUB,
         "代码有钩子，但 credit_probe_url 需抓包填真实地址")
 
-    token_keys = ("accessToken", "refreshToken", "authorization")
-    add("桩位", "客户端 Token 位置", STUB,
-        "代码扫 %APPDATA%\\Qoder 与 CDP；若客户端加密存储需额外标定")
+    # 客户端 Token 抓取能力：扫 token_harvester 看是否已支持 0.4.x safe_storage 解密
+    th = ROOT / "app" / "claim" / "token_harvester.py"
+    thsrc = th.read_text(encoding="utf-8") if th.exists() else ""
+    has_safe_storage = "harvest_from_safe_storage" in thsrc
+    has_process_dir = "_user_data_dir_from_process" in thsrc
+    if has_safe_storage and has_process_dir:
+        add("桩位", "客户端 Token 位置", READY,
+            "支持 0.4.x safe_storage（DPAPI+AES-GCM 解 auth.v1.dat）+ 进程 --user-data-dir 推断")
+    elif has_safe_storage or has_process_dir:
+        add("桩位", "客户端 Token 位置", STUB,
+            "部分支持，需补全 safe_storage 解密或进程目录推断")
+    else:
+        add("桩位", "客户端 Token 位置", STUB,
+            "代码扫 %APPDATA%\\Qoder 与 CDP；若客户端加密存储需额外标定")
 
 
 # ============================================================ 6. 功能自测

@@ -63,6 +63,22 @@ Qoder 注册走网页，服务端拿到的所有环境信号里，能跨会话�
 
 一个 region 下有多条候选时随机选，保证同一地区的多个账号不撞同一个组合。
 
+### 3.1 客户端侧设备指纹与浏览器画像匹配（2026-11-17 新增）
+
+注册（网页）与领取（客户端）分属两套指纹。默认设备重置走原随机方案；
+`device.identity_mode: browser` 开启匹配模式：领取段用注册段同款 seed
+（`make_profile(region, seed=acct{id})`，确定性）重建浏览器画像，再由
+`app/device/identity_profile.py` 派生设备身份 —— 平台/时区/语言/CPU 线程数/
+内存/GPU/分辨率与比特浏览器环境完全一致，且同一账号跨重置不漂移
+（指纹浏览器三铁律：同 seed 稳定 / 跨 seed 不同 / 字段强一致）。
+
+```bash
+python -m app.cli device:reset --identity-mode browser --seed acct1024 --region us
+```
+
+不能复刻的部分：真硬件层（MAC/卷序列号/GPU 真渲染）是指纹浏览器改 C++ 内核
+的领地，本方案只覆盖应用数据层（machineid/telemetry/storage.json/假硬件 JSON）。
+
 ---
 
 ## 4. 注入脚本覆盖点（Playwright 兜底后端）
