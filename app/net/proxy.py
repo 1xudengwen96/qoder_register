@@ -27,6 +27,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -183,6 +184,7 @@ class ProxyPool:
     def __init__(self, proxies: list[Proxy], skipped: int = 0) -> None:
         self.proxies = proxies
         self.skipped = skipped
+        self._lock = threading.Lock()   # 并发 worker 共享池，last_used/use_count 必须互斥
         self._by_region: dict[str, list[Proxy]] = {}
         for p in proxies:
             self._by_region.setdefault(p.region or "any", []).append(p)
@@ -212,20 +214,21 @@ class ProxyPool:
     # ---- 分配 -------------------------------------------------------------
     def acquire(self, region: str | None = None, exclude: set[str] | None = None) -> Proxy | None:
         exclude = exclude or set()
-        pool = [
-            p
-            for p in (self._by_region.get(region, []) if region else self.proxies)
-            if p.health == "ok" and p.raw not in exclude
-        ]
-        if not pool:
-            pool = [p for p in self.proxies if p.health == "ok"]
-        if not pool:
-            return None
-        # 优先用最久没被用过的，降低同一 IP 复用
-        proxy = min(pool, key=lambda p: p.last_used)
-        proxy.last_used = time.time()
-        proxy.use_count += 1
-        return proxy
+        with self._lock:
+            pool = [
+                p
+                for p in (self._by_region.get(region, []) if region else self.proxies)
+                if p.health == "ok" and p.raw not in exclude
+            ]
+            if not pool:
+                pool = [p for p in self.proxies if p.health == "ok"]
+            if not pool:
+                return None
+            # 优先用最久没被用过的，降低同一 IP 复用
+            proxy = min(pool, key=lambda p: p.last_used)
+            proxy.last_used = time.time()
+            proxy.use_count += 1
+            return proxy
 
     # ---- 健康检查 ---------------------------------------------------------
     def check(self, proxy: Proxy, timeout: int = 10) -> bool:
@@ -273,6 +276,34 @@ LEDGER_DEFAULT = Path("data/.proxy_state.json")
 _SESSION_ALPHABET = "0123456789abcdef"
 
 
+@contextlib.contextmanager
+def _locked_file(lock_path: Path, timeout: float = 15.0, stale: float = 60.0):
+    """O_EXCL 锁文件：线程/进程都互斥；持锁方崩掉后 stale 秒自动回收。"""
+    deadline = time.time() + timeout
+    fd = None
+    while time.time() < deadline:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > stale:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(0.05)
+    if fd is None:
+        raise RuntimeError(f"文件加锁超时：{lock_path}")
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+        finally:
+            lock_path.unlink(missing_ok=True)
+
+
 class ProxyLedger:
     """记录每条代理被哪一轮用过，用完即作废（one-shot）。
 
@@ -294,29 +325,8 @@ class ProxyLedger:
     # ---------------------------------------------------------- 锁
     @contextlib.contextmanager
     def _locked(self):
-        deadline = time.time() + self.lock_timeout
-        fd = None
-        while time.time() < deadline:
-            try:
-                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                try:
-                    if time.time() - self.lock_path.stat().st_mtime > self.stale_lock:
-                        self.lock_path.unlink(missing_ok=True)
-                        continue
-                except FileNotFoundError:
-                    continue
-                time.sleep(0.05)
-        if fd is None:
-            raise RuntimeError(f"代理账本加锁超时：{self.lock_path}")
-        try:
+        with _locked_file(self.lock_path, self.lock_timeout, self.stale_lock):
             yield
-        finally:
-            try:
-                os.close(fd)
-            finally:
-                self.lock_path.unlink(missing_ok=True)
 
     # ---------------------------------------------------------- 读写
     def _read(self) -> dict:
@@ -364,6 +374,27 @@ class ProxyLedger:
                 "note": note,
             }
             self._write(data)
+
+    def reserve_if_free(self, proxy: Proxy, env: str = "",
+                        note: str = "reserved") -> bool:
+        """原子地“查未用 + 占位”：已被用过返回 False。
+
+        并发下 is_used → reserve 分两步会让两个 worker 都判“未用”
+        而抢到同一条，必须在同一把锁里完成。
+        """
+        with self._locked():
+            data = self._read()
+            if proxy.raw in data["entries"]:
+                return False
+            data["entries"][proxy.raw] = {
+                "used_at": time.time(),
+                "label": proxy.label,
+                "env": env,
+                "ip": "",
+                "note": note,
+            }
+            self._write(data)
+            return True
 
     def mark(self, proxy: Proxy, env: str = "", ip: str = "",
              note: str = "ok") -> None:
@@ -437,33 +468,36 @@ def acquire_for_browser(cfg, region: str = "sg",
     want_cc = region.upper()
 
     # 1) ip.txt：消耗式取用（取一行删一行，用完即止）
+    #    读→挑→写回必须整段互斥（线程/进程），否则两个 worker 会读到
+    #    同一份清单抢走同一条，且后写者把先写者的删行覆盖掉。
     p = Path(ip_file)
     if p.exists():
         try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-            pick = -1
-            px = None
-            for i, line in enumerate(lines):
-                s = line.strip()
-                if not s or s.startswith(("#", ";", "//")):
-                    continue
-                cand = parse_line(s)
-                if cand:
-                    pick, px = i, cand
-                    break
-            if px is not None:
-                rest = [ln for j, ln in enumerate(lines) if j != pick]
-                tmp = p.with_suffix(p.suffix + ".tmp")
-                tmp.write_text("\n".join(rest) + ("\n" if rest else ""),
-                               encoding="utf-8")
-                tmp.replace(p)          # 原子替换，避免读到半截文件
-                used = p.parent / "ip_used.txt"
-                try:
-                    with open(used, "a", encoding="utf-8") as fh:
-                        fh.write(px.raw + "\n")
-                except Exception:
-                    pass                # 审计记录失败不影响主流程
-                return px
+            with _locked_file(p.with_suffix(p.suffix + ".lock")):
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                pick = -1
+                px = None
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    if not s or s.startswith(("#", ";", "//")):
+                        continue
+                    cand = parse_line(s)
+                    if cand:
+                        pick, px = i, cand
+                        break
+                if px is not None:
+                    rest = [ln for j, ln in enumerate(lines) if j != pick]
+                    tmp = p.with_suffix(p.suffix + ".tmp")
+                    tmp.write_text("\n".join(rest) + ("\n" if rest else ""),
+                                   encoding="utf-8")
+                    tmp.replace(p)          # 原子替换，避免读到半截文件
+                    used = p.parent / "ip_used.txt"
+                    try:
+                        with open(used, "a", encoding="utf-8") as fh:
+                            fh.write(px.raw + "\n")
+                    except Exception:
+                        pass                # 审计记录失败不影响主流程
+                    return px
         except Exception:
             pass
 
@@ -547,12 +581,14 @@ def acquire_once(pool: "ProxyPool", ledger: ProxyLedger,
         cands = same or cands
     ordered = sorted(cands, key=lambda x: (x.last_used, x.port))
     for p in ordered:
-        if ledger.is_used(p.raw):
+        if ledger.is_used(p.raw):      # 廉价预筛，避免对已用代理做真连检查
             continue
         if check and not pool.check(p, timeout=timeout):
             ledger.mark(p, note="dead")
             continue
-        ledger.reserve(p, note="reserved")
+        # 原子“查未用 + 占位”：并发下分两步会抢到同一条
+        if not ledger.reserve_if_free(p, note="reserved"):
+            continue
         p.last_used = time.time()
         p.use_count += 1
         return p

@@ -11,6 +11,7 @@ Apple ID 主邮箱。所以：
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -43,6 +44,7 @@ class ICloudRelayProvider:
         self.quota_total = quota_total
         self.taken = {a.lower() for a in (taken_addresses or set())}
         self.cursor = 0
+        self._lock = threading.Lock()   # 并发 worker 共享本 provider，cursor/taken 必须互斥
 
     def _load(self) -> list[str]:
         if not self.path.exists():
@@ -60,22 +62,23 @@ class ICloudRelayProvider:
     # ---- pool -------------------------------------------------------------
     def acquire(self, n: int = 1) -> list[MailIdentity]:
         out: list[MailIdentity] = []
-        while self.cursor < len(self.addresses) and len(out) < n:
-            addr = self.addresses[self.cursor]
-            self.cursor += 1
-            if addr.lower() in self.taken:
-                continue
-            self.taken.add(addr.lower())
-            out.append(
-                MailIdentity(
-                    address=addr,
-                    provider=self.name,
-                    parent_account=self.agg_user,
-                    secret=None,
-                    imap_host=self.agg_host,
-                    meta={"relay": True, "aggregator": self.agg_user},
+        with self._lock:
+            while self.cursor < len(self.addresses) and len(out) < n:
+                addr = self.addresses[self.cursor]
+                self.cursor += 1
+                if addr.lower() in self.taken:
+                    continue
+                self.taken.add(addr.lower())
+                out.append(
+                    MailIdentity(
+                        address=addr,
+                        provider=self.name,
+                        parent_account=self.agg_user,
+                        secret=None,
+                        imap_host=self.agg_host,
+                        meta={"relay": True, "aggregator": self.agg_user},
+                    )
                 )
-            )
         return out
 
     # ---- receive ----------------------------------------------------------

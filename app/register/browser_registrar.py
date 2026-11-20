@@ -117,9 +117,15 @@ class BrowserRegistrar:
         if not self.humanize:
             await loc.fill(text)
             return
+        await page.wait_for_timeout(random.randint(250, 700))
         for ch in text:
-            await loc.type(ch, delay=random.randint(45, 165))
-        await page.wait_for_timeout(random.randint(180, 700))
+            d = random.randint(90, 280)
+            if not ch.isalnum():
+                d += random.randint(50, 180)
+            await loc.type(ch, delay=d)
+            if random.random() < 0.07:
+                await page.wait_for_timeout(random.randint(350, 1000))
+        await page.wait_for_timeout(random.randint(400, 1100))
 
     async def _move_mouse_randomly(self, page: Any, times: int = 3) -> None:
         if not self.humanize:
@@ -160,7 +166,9 @@ class BrowserRegistrar:
             b64 = base64.b64encode(raw).decode()
             res = self.solver.solve(CaptchaTask(kind="image", image_b64=b64, proxy=proxy_raw))
             field = page.locator(self.sel.image_captcha_input).first
-            await field.fill(res.token)
+            await field.click()
+            for ch in res.token:
+                await field.type(ch, delay=random.randint(90, 260))
             return res.provider
 
         site_key = self.site_keys.get(kind)
@@ -309,7 +317,7 @@ class BrowserRegistrar:
                     result = await self._classify(page)
 
             result.screenshot = await self._shot(
-                page, f"{result.kind}_{int(time.time())}")
+                page, f"{result.kind}_{int(time.time())}_{random.randrange(1 << 20):05x}")
             result.used_captcha = used_captcha
             result.elapsed = time.time() - t0
             return result

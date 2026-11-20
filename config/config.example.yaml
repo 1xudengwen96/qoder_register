@@ -14,7 +14,8 @@ mail:
   provider: ""
   # weighted: 按权重取；strict_priority: 按顺序优先耗尽；round_robin: 轮转
   strategy: strict_priority   # 先用清单里那 10 个真邮箱，耗尽了再往下掉
-  # IMAP / 2Captcha 走的本机隧道（Clash 之类），留空＝直连
+  # 2Captcha 打码请求走的本机隧道（Clash 之类），留空＝直连。
+  # 注意：QQ IMAP 收信（imap.qq.com:993）不走任何代理，始终直连。
   imap_proxy: ""
   # Outlook 清单：email----密码----clientId----refreshToken（一行一个）
   # 填了就用文件收码；留空回落到数据库邮箱池
@@ -78,7 +79,7 @@ browser:
     group_id: "0"
 
   bitbrowser:
-    api_base: "http://127.0.0.1:54345"
+    port: 54345                 # 本地 API 端口（比特客户端设置可改；前端控制台亦可配置/测试）
     group_id: ""                 # 留空＝默认分组
     reuse_env: false            # 每轮新建窗口（指纹随机 + 代理写入后再启动）
     env_id: ""                   # 指定固定环境 id；留空按账号名自动建/找
@@ -156,6 +157,9 @@ claim:
 #   http://user:pass@host:port#us
 #   socks5://user:pass@host:port
 proxy:
+  # 总开关：true = 走代理（ip.txt / ipdeep 兜底）；false = 全链路直连
+  # （比特环境 proxyMethod=3，用本机出口 IP 注册；QQ IMAP 收信始终直连）
+  enabled: true
   source: file
   file: "data/proxies.txt"
   default_scheme: "http"       # 四段格式默认当 http 代理

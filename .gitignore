@@ -1,49 +1,24 @@
-# Local dependencies and package installer scratch files
-.pylibs/
-.wheels/
-.tmp/
-.tmp2/
-pip-*/
-.venv/
-venv/
-
-# Python caches and test output
+# Python è¿è¡Œæ—¶ / ç¼“å­˜
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.coverage
-htmlcov/
-tests/_tmp/
+*.pyc
+*.pyo
 
-# Local credentials and runtime data
-.env
-.env.*
-!.env.example
-config/config.yaml
-data/*
-!data/.gitkeep
-*.log
+# éšåŒ…ä¾èµ–ï¼ˆä½“ç§¯å¤§ï¼Œä¸å…¥åº“ï¼Œç”¨ setup.bat / bootstrap_deps.py è¿˜åŸï¼‰
+.pylibs/
 
-# Editor and operating system files
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+# è¿è¡Œæ•°æ®ï¼šæ•°æ®åº“ã€æ—¥å¿—ã€é‚®ç®±æ¸…å•ã€å‡­æ®ã€è®¾å¤‡å¤‡ä»½ã€äº§ç‰©
+data/
 
-# ????????????§Ó???
+# æœ¬æœºçœŸå®é…ç½®ï¼ˆå«æ˜æ–‡å¯†é’¥/æˆæƒç ï¼‰ï¼Œåªæäº¤ config.example.yaml æ¨¡æ¿
 config/secrets.yaml
+config/config.yaml
+config/config.watch.yaml
 
+# å®‰è£…åŒ… / å‹ç¼©åŒ…
+*.exe
+*.zip
 
-.tools/
-.ms-playwright/
-
-
-# ±¾»úÔËĞĞ½Å±¾ / ´úÀíÇåµ¥£¨º¬ÕËºÅÃÜÂë£¬¾ø²»½ø²Ö¿â£©
-env.ps1
-proxies-*.txt
-data/*.csv
-data/*.txt
-
-# ´úÀíÇåµ¥±¸·İ£¨º¬ÕËºÅÃÜÂë£©
-proxies-*.txt*
-*.bak
+# ä¸´æ—¶è„šæœ¬
+_install_git.ps1
+_net_diag.ps1
+_git_push.ps1

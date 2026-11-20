@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -46,6 +47,7 @@ class OutlookFileProvider:
         self._accounts = []
         self._mtime = -1.0
         self._used: set[str] = set()
+        self._lock = threading.Lock()   # 并发 worker 共享本 provider，_used/重读清单必须互斥
         self._load(force=True)
 
     # ---------------------------------------------------------- 清单
@@ -76,28 +78,29 @@ class OutlookFileProvider:
 
     # ---------------------------------------------------------- 取地址
     def acquire(self, n: int = 1) -> list[MailIdentity]:
-        self._load()
         out: list[MailIdentity] = []
-        for a in self._accounts:
-            if len(out) >= n:
-                break
-            addr = a.email.strip().lower()
-            if not addr or addr in self.taken or addr in self._used:
-                continue
-            self._used.add(addr)
-            out.append(MailIdentity(
-                address=a.email.strip(),
-                provider=self.name,
-                parent_account=a.email.strip(),
-                secret=a.password or None,
-                imap_host=OUTLOOK_IMAP,
-                meta={
-                    "client_id": a.client_id,
-                    "refresh_token": a.refresh_token,
-                    "has_oauth": a.has_oauth,
-                    "source": str(self.path),
-                },
-            ))
+        with self._lock:
+            self._load()
+            for a in self._accounts:
+                if len(out) >= n:
+                    break
+                addr = a.email.strip().lower()
+                if not addr or addr in self.taken or addr in self._used:
+                    continue
+                self._used.add(addr)
+                out.append(MailIdentity(
+                    address=a.email.strip(),
+                    provider=self.name,
+                    parent_account=a.email.strip(),
+                    secret=a.password or None,
+                    imap_host=OUTLOOK_IMAP,
+                    meta={
+                        "client_id": a.client_id,
+                        "refresh_token": a.refresh_token,
+                        "has_oauth": a.has_oauth,
+                        "source": str(self.path),
+                    },
+                ))
         return out
 
     # ---------------------------------------------------------- 收信

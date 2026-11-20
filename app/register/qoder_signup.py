@@ -117,8 +117,8 @@ class QoderSignup:
         await asyncio.sleep(random.uniform(lo, hi))
 
     async def _type(self, selector: str, text: str,
-                    delay: tuple[int, int] = (45, 140)) -> bool:
-        """逐字符输入，模拟真人节奏。"""
+                    delay: tuple[int, int] = (90, 260)) -> bool:
+        """逐字符输入，模拟真人节奏（放慢，符号后略迟疑）。"""
         loc = self.page.locator(selector).first
         if await loc.count() == 0:
             return False
@@ -127,9 +127,15 @@ class QoderSignup:
         if not self.humanize:
             await loc.fill(text)
             return True
+        await self._sleep(0.25, 0.7)
         for ch in text:
-            await loc.type(ch, delay=random.randint(*delay))
-        await self._sleep(0.2, 0.7)
+            d = random.randint(*delay)
+            if not ch.isalnum():
+                d += random.randint(50, 180)
+            await loc.type(ch, delay=d)
+            if random.random() < 0.07:
+                await self._sleep(0.35, 1.0)
+        await self._sleep(0.4, 1.0)
         return True
 
     async def _shot(self, name: str) -> str:
@@ -175,7 +181,7 @@ class QoderSignup:
         try:
             await loc.click(timeout=5000)
             await loc.fill("")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(random.uniform(0.25, 0.5))
         except Exception:
             pass
 
@@ -192,6 +198,7 @@ class QoderSignup:
                     "windowsVirtualKeyCode": ord(ch),
                     "nativeVirtualKeyCode": ord(ch),
                 })
+                await asyncio.sleep(random.uniform(0.05, 0.13))  # 持键时长
                 await cdp.send("Input.dispatchKeyEvent", {
                     "type": "keyUp",
                     "key": ch,
@@ -199,13 +206,13 @@ class QoderSignup:
                     "windowsVirtualKeyCode": ord(ch),
                     "nativeVirtualKeyCode": ord(ch),
                 })
-                await asyncio.sleep(random.uniform(0.06, 0.16))
+                await asyncio.sleep(random.uniform(0.12, 0.3))
             self._d(f"CDP 键盘已输入 {len(digits)} 位")
         except Exception as exc:
             self._d(f"CDP 键盘失败: {type(exc).__name__}: {exc}，退回 type()")
             try:
                 await loc.click()
-                await loc.type("".join(digits), delay=80)
+                await loc.type("".join(digits), delay=160)
             except Exception:
                 return False
 

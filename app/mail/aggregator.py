@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Callable
 
@@ -22,6 +23,9 @@ class MailAggregator:
         self.strategy = strategy
         self.weights = weights or {}
         self.strict_order = strict_order or list(providers)
+        # 并发 worker 共享同一个聚合器：跨 provider 的调度决策也要互斥，
+        # 否则两个线程可能同时判“某源还有货”而重复取同一地址。
+        self._acquire_lock = threading.Lock()
 
     # ---- 取地址 -----------------------------------------------------------
     def _ordered_providers(self) -> list[str]:
@@ -37,6 +41,10 @@ class MailAggregator:
         )
 
     def acquire(self, n: int = 1) -> list[MailIdentity]:
+        with self._acquire_lock:
+            return self._acquire_locked(n)
+
+    def _acquire_locked(self, n: int) -> list[MailIdentity]:
         out: list[MailIdentity] = []
         order = self._ordered_providers()
         if self.strategy == "weighted" and self.weights:

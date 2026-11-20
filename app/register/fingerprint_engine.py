@@ -100,7 +100,7 @@ UA_TEMPLATES = {
     ),
 }
 
-CHROME_MAJORS = [128, 129, 130, 131]
+CHROME_MAJORS = [154, 155, 156, 157, 158]  # 2026-11 在野主流；Chrome 自动更新
 
 
 # ------------------------------------------------------------ 指纹画像
@@ -189,7 +189,7 @@ def make_profile(region: str = "us", platform_hint: str = "win",
         accept_language=rng.choice(prof["accept_languages"]),
         platform=plat,
         hardware_concurrency=rng.choice([4, 8, 12, 16]),
-        device_memory=rng.choice([8, 16, 32]),
+        device_memory=rng.choice([4, 8]),  # 比特 deviceMemory 上限 8GB，池必须都在界内
         webgl_vendor=vendor,
         webgl_renderer=renderer,
         canvas_noise_seed=canvas_seed,
@@ -511,7 +511,7 @@ class BitBrowserEngine(FingerprintEngine):
                 self.client.update_env(
                     existing,
                     browserFingerPrint=build_fingerprint(
-                        ua=profile.user_agent,
+                        # ua 不传：比特按内核 156 自动生成，避免旧 UA 矛盾
                         screen_w=profile.viewport_w,
                         screen_h=profile.viewport_h,
                         timezone=profile.timezone,
@@ -529,7 +529,7 @@ class BitBrowserEngine(FingerprintEngine):
                 pass
 
         fp = build_fingerprint(
-            ua=profile.user_agent,
+            # ua 不传：比特按内核 156 自动生成，避免旧 UA 矛盾
             screen_w=profile.viewport_w,
             screen_h=profile.viewport_h,
             timezone=profile.timezone,
@@ -776,8 +776,9 @@ def _make_engine(cfg, name: str) -> FingerprintEngine:
             group_id=str(get(cfg, "browser.adspower.group_id", "0")),
         )
     if name == "bitbrowser":
+        from app.register.bitbrowser import resolve_base
         return BitBrowserEngine(
-            api_base=get(cfg, "browser.bitbrowser.api_base", "http://127.0.0.1:54345"),
+            api_base=resolve_base(cfg),
             token=get(cfg, "browser.bitbrowser.token", None) or None,
             group_id=get(cfg, "browser.bitbrowser.group_id", None) or None,
             reuse_env=bool(get(cfg, "browser.bitbrowser.reuse_env", True)),

@@ -81,9 +81,12 @@ import socket
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import requests
+
+from app.net.proxy import _locked_file
 
 
 # ============================================================ 异常
@@ -105,6 +108,57 @@ class RateLimitedError(BitBrowserError):
 
 
 # ============================================================ 常量
+# 比特本地 API 默认端口（客户端设置里可改；前端控制台亦可配置）
+DEFAULT_PORT = 54345
+
+
+def resolve_base(cfg: dict | None = None) -> str:
+    """比特 API 地址：``browser.bitbrowser.port`` 优先（前端可改），
+    没配 port 时兼容旧配置 ``api_base``，再退回默认 54345。"""
+    from app.config import load_config, get
+
+    if cfg is None:
+        cfg = load_config()
+    try:
+        port = int(get(cfg, "browser.bitbrowser.port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if port:
+        return f"http://127.0.0.1:{port}"
+    return str(get(cfg, "browser.bitbrowser.api_base",
+                   f"http://127.0.0.1:{DEFAULT_PORT}"))
+
+
+# ------------------------------------------------------------ 全局限流闸
+# 实测 0.3s 间隔即触发「请求频繁」；频繁报错会进一步触发比特客户端
+# 安全机制（自动退出登录）。限流必须跨客户端实例、跨进程全局生效：
+# webui 每请求新建 client、多 tab 轮询、注册进程并发——实例级节流拦不住。
+GLOBAL_MIN_INTERVAL = 1.2   # 任意两次 API 调用的最小起始间隔（秒）
+RATE_BACKOFF = 2.5          # 撞限流后的退避基数（秒），按重试次数递增
+_ROOT = Path(__file__).resolve().parents[2]
+_GATE_LOCK = _ROOT / "data" / ".bb_api_gate.lock"
+_GATE_TS = _ROOT / "data" / ".bb_api_gate.ts"
+
+
+def _api_gate(interval: float) -> None:
+    """全局限流排队：O_EXCL 锁文件线程+进程互斥，持锁读上次调用时间戳
+    → sleep 补足间隔 → 写回。持锁 sleep 即串行排队，崩溃 stale=10s 回收。"""
+    interval = max(float(interval), GLOBAL_MIN_INTERVAL)
+    with _locked_file(_GATE_LOCK, timeout=30, stale=10):
+        try:
+            last = float(_GATE_TS.read_text(encoding="utf-8").strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        wait = last + interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            _GATE_TS.parent.mkdir(parents=True, exist_ok=True)
+            _GATE_TS.write_text(str(time.time()), encoding="utf-8")
+        except OSError:
+            pass
+
+
 # /browser/update 必须回传的代理字段（漏一个就报「请传入 proxyMethod」）
 PROXY_FIELDS = (
     "proxyMethod", "proxyType", "host", "port",
@@ -191,58 +245,75 @@ class LaunchResult:
 # ============================================================ 指纹构造
 def build_fingerprint(
     *,
-    ua: str,
+    ua: str = "",
     screen_w: int = 1920,
     screen_h: int = 1080,
-    timezone: str = "America/New_York",
+    timezone: str = "",
     languages: list[str] | None = None,
     os_type: str = "Win32",
-    core_version: str = "131",
+    core_version: str = "156",
     hardware_concurrency: int = 8,
     device_memory: int = 8,
     fonts: list[str] | None = None,
     canvas_noise: bool = True,
     webgl_noise: bool = True,
     audio_noise: bool = True,
-    webrtc: str = "disabled",
+    webrtc: str = "2",
     do_not_track: bool = False,
     browser_kernel: str = "chrome",
 ) -> dict:
-    """构造 ``browserFingerPrint`` 对象。
+    """构造 ``browserFingerPrint`` 对象（对齐 2026 版比特 API 文档）。
 
-    比特浏览器实测**必需**字段：``coreVersion``、``ostype``、``os``。
-    其余字段不传会走默认值，但明确传可以保证指纹可控。
+    实测教训（2026-11-17 acct30 复盘）：旧版字段名 ``ua``/``language``/
+    ``screenWidth``/``fonts`` 已全部不被识别，比特回退随机指纹，出现
+    "美国出口 IP + Europe/Helsinki + fi-FI" 的地理错位 → Baxia 直接弹
+    九宫格盯死。新版字段注意两个坑：
 
-    ``canvas`` / ``webGL`` / ``audioContext`` 传 ``"1"`` 表示开启噪声（推荐），
-    这是它比 JS 注入强的地方 —— 噪声在 C++ 渲染层生成，页面脚本看不到注入痕迹。
+    - ``canvas``/``webGL``/``audioContext`` 是 '0'=噪声、'1'=禁用，
+      与旧语义相反，传错等于把噪声保护关掉；
+    - 时区/语言/经纬度用 ``isIpCreate*`` 按**出口 IP** 自动生成，
+      永远与 IP 一致，比手工指定更稳。
+
+    ``ua`` 默认留空（比特按内核自动生成，与 coreVersion 一致——手工传
+    旧版本号反而制造 UA/内核矛盾）。
     """
-    langs = languages or ["en-US", "en"]
-    return {
-        "coreVersion": core_version,
+    fp = {
+        "coreProduct": browser_kernel,
+        "coreVersion": core_version,       # 比特当前内核，156=Chrome 156
         "ostype": "PC",
-        "os": os_type,
-        "isIpv6": False,
-        "isRandomFinger": False,
-        "ua": ua,
-        "screenWidth": screen_w,
-        "screenHeight": screen_h,
-        "fonts": fonts or ["Arial", "Verdana", "Segoe UI", "Tahoma"],
-        "language": langs,
-        "displayLanguages": ",".join(langs),
-        "timeZone": timezone,
-        "webRTC": webrtc,
-        "canvas": "1" if canvas_noise else "0",
-        "webGL": "1" if webgl_noise else "0",
-        "audioContext": "1" if audio_noise else "0",
-        "hardwareConcurrency": hardware_concurrency,
-        "deviceMemory": device_memory,
-        "doNotTrack": do_not_track,
-        "position": "1",                 # 1 = 基于 IP 自动定位
-        "browserKernel": browser_kernel,
+        "os": os_type,                     # navigator.platform 值
+        # 时区/语言/经纬度随出口 IP 自动生成（防地理错位的正解）
         "isIpCreateTimeZone": True,
         "isIpCreateLanguage": True,
         "isIpCreatePosition": True,
+        "position": "1",
+        "webRTC": webrtc,                  # '0'替换 | '1'允许 | '2'禁用
+        # 噪声类：'0'=开噪声（保护），'1'=禁用噪声（裸奔）
+        "canvas": "0" if canvas_noise else "1",
+        "webGL": "0" if webgl_noise else "1",
+        "webGLMeta": "0",
+        "audioContext": "0" if audio_noise else "1",
+        "mediaDevice": "0",
+        "speechVoices": "0",
+        "clientRectNoiseEnabled": True,
+        "hardwareConcurrency": str(hardware_concurrency),
+        "deviceMemory": str(min(device_memory, 8)),  # 文档要求 ≤8
+        "doNotTrack": "1" if do_not_track else "0",
+        "resolutionType": "1",
+        "resolution": f"{screen_w} x {screen_h}",
+        "devicePixelRatio": 1,
+        "fontType": "2",                   # 服务端随机字体列表
+        "font": "",
+        "portScanProtect": "0",            # 开端口扫描防护（防 CDP 探测）
+        "deviceInfoEnabled": True,
+        "computerName": "",
+        "macAddr": "",
     }
+    # userAgent 空串会被比特判"userAgent 数据格式错误"，
+    # 不传该字段=按内核自动生成（与 coreVersion 一致）
+    if ua:
+        fp["userAgent"] = ua
+    return fp
 
 
 def build_proxy_config(
@@ -258,9 +329,13 @@ def build_proxy_config(
                                        ``http://user:pass@host:port`` 都认（走 parse_line）
 
     返回可直接 ``**`` 展开进 ``/browser/update`` 请求体的 dict。
+
+    直连的正确组合（官方文档示例）：``proxyMethod=2`` + ``proxyType='noproxy'``
+    + host 留空。**不是** proxyMethod=3——3 是"提取 IP"模式，open 时会报
+    ``请填写提取URL: dynamicIpUrl``。
     """
     if not proxy:
-        return {"proxyMethod": 3, "proxyType": "noproxy"}
+        return {"proxyMethod": 2, "proxyType": "noproxy"}
 
     if isinstance(proxy, dict):
         if proxy.get("proxyMethod"):
@@ -310,7 +385,8 @@ class BitBrowserClient:
     """比特浏览器本地 API 客户端。
 
     特性：
-    - 自动限流（默认 1.2 秒最小间隔，实测 0.3 秒会触发"请求频繁"）
+    - 全局限流（跨实例/跨进程 ≥1.2s 间隔；实测 0.3s 触发"请求频繁"，
+      频繁报错会触发客户端安全机制自动退登）
     - 错误码分类（11018 抛 ``LaunchRestrictedError``）
     - 启动结果直接给出 Playwright 可用的 CDP 地址
     """
@@ -338,10 +414,7 @@ class BitBrowserClient:
         return h
 
     def _throttle(self) -> None:
-        gap = time.time() - self._last_call
-        if gap < self.min_interval:
-            time.sleep(self.min_interval - gap)
-        self._last_call = time.time()
+        _api_gate(self.min_interval)
 
     def call(self, path: str, body: dict | None = None,
              timeout: int | None = None, retries: int = 2) -> dict:
@@ -364,7 +437,7 @@ class BitBrowserClient:
             msg = str(data.get("msg") or "")
             if "请求频繁" in msg:
                 if attempt < retries:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(RATE_BACKOFF * (attempt + 1))
                     continue
                 raise RateLimitedError("Local API rate limited")
             if "窗口被限制打开" in msg:

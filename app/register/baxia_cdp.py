@@ -193,11 +193,21 @@ JS_CENTERS = r"""(() => {
   };
   const grids = [];
   const selected = [];
+  const win = d.defaultView;
   for (let i = 0; i < 9; i++) {
     const g = d.getElementById('click-grid-' + i);
     if (g) {
-      grids.push(Object.assign({i}, center(g)));
-      if ((g.style.opacity || '') === '0') selected.push(i);
+      const cls = (g.className || '') + '';
+      const sop = g.style.opacity || '';
+      let cop = '';
+      try { cop = win.getComputedStyle(g).opacity; } catch (e) {}
+      grids.push(Object.assign({i, cls, sop, cop}, center(g)));
+      // 选中态从宽判定：内联 opacity / computed opacity / class 任一命中。
+      // 实测（2026-11-17 夜 23 连败）：只用内联 style.opacity 时，组件在
+      // 点击后的重渲染/transition 中会把内联值清掉，selected 读数丢失，
+      // 补点逻辑按假读数乱点，实际选择集合错 → 服务端判拒。
+      if (sop === '0' || cop === '0' ||
+          /select|chosen|active|check/i.test(cls)) selected.push(i);
     }
   }
   const sub = d.getElementById('click-submit');
@@ -251,7 +261,10 @@ class BaxiaClickCaptcha:
 
     def solved(self) -> bool:
         st = self.page.eval(JS_STATE) or {}
-        return bool(st.get("x5sec")) or not st.get("iframe")
+        # 注意：九宫格是 OTP 后的二次验证，弹窗期间主页面仍是
+        # 「验证邮箱」文本——不能用页面文本判通过（2026-11-18 实测误判）。
+        # 只信 x5sec cookie 或 iframe 不可见/消失。
+        return bool(st.get("x5sec")) or not st.get("visible")
 
     # ---------------------------------------------------------- 取图
     def capture(self, retries: int = 5) -> dict:
@@ -280,6 +293,7 @@ class BaxiaClickCaptcha:
         实测：选中一格后布局会重排（底部出现选中条），用旧坐标点第二格会点空。
         """
         clicked: list[int] = []
+        time.sleep(0.8)   # 组件初始化/入场动画期间点击会被忽略，先等稳定
         for idx in cells:
             for _ in range(3):
                 data = self.centers()
@@ -288,14 +302,39 @@ class BaxiaClickCaptcha:
                 if not g:
                     break
                 self.page.click_xy(float(g["x"]), float(g["y"]), human=True)
-                time.sleep(0.7)
-                if int(idx) in (self.centers().get("selected") or []):
+                # 诊断：高频采样选中态——区分「从未选中」(点不中)
+                # 与「闪现后撤销」(行为判废)；并查点击点最上层元素
+                flash = False
+                for _s in range(10):
+                    time.sleep(0.15)
+                    if int(idx) in (self.centers().get("selected") or []):
+                        flash = True
+                        break
+                time.sleep(0.4)
+                after = self.centers()
+                if int(idx) in (after.get("selected") or []):
                     clicked.append(int(idx))
                     break
+                hit = self.page.eval(f"""(() => {{
+                  const fr = document.getElementById('baxia-dialog-content');
+                  if (!fr || !fr.contentDocument) return 'no-doc';
+                  const r = fr.getBoundingClientRect();
+                  const el = fr.contentDocument.elementFromPoint(
+                    {float(g["x"])} - r.left, {float(g["y"])} - r.top);
+                  return el ? (el.id || el.tagName + '.' + el.className) : 'null';
+                }})()""")
+                self._d(f"格 {idx} 第 {_} 轮: flash={flash} 点后仍在={int(idx) in (after.get('selected') or [])} 命中元素={hit}")
+                # 3 轮补点里每一轮的格子真实状态（诊断选中态判定）
+                st = {int(x["i"]): (x.get("cls", "")[:24],
+                                    f"sop={x.get('sop')} cop={x.get('cop')}")
+                      for x in (after.get("grids") or [])}
+                self._d(f"格 {idx} 第 {_} 轮未确认选中，全格状态 {st}")
+                time.sleep(1.0)   # 被忽略时多等一拍再补点
             time.sleep(0.2)
         return clicked
 
-    def screenshot_instructions(self, scale: float = 3.0) -> bytes | None:
+    def screenshot_instructions(self, scale: float = 3.0,
+                                height: float = 130) -> bytes | None:
         """截 iframe 顶部题面区域（题干文字 + 目标图案的渲染结果）。
 
         题干 canvas 与目标图案 canvas 都是**逐帧随机噪点**动画（单帧截图
@@ -316,7 +355,7 @@ class BaxiaClickCaptcha:
                 res = self.page.cdp.call("Page.captureScreenshot", {
                     "format": "png",
                     "clip": {"x": rect["x"], "y": max(0.0, rect["y"]),
-                             "width": rect["w"], "height": 130,
+                             "width": rect["w"], "height": height,
                              "scale": scale},
                 })
                 frames.append(Image.open(io.BytesIO(
@@ -339,7 +378,7 @@ class BaxiaClickCaptcha:
         for quality in (0.9, 0.75, 0.6):
             buf = io.BytesIO()
             avg.save(buf, format="JPEG", quality=int(quality * 100))
-            if buf.tell() < 128000:
+            if buf.tell() < 95000:   # GridTask imgInstructions 限 100kB
                 break
         return buf.getvalue()
 
@@ -364,15 +403,32 @@ class BaxiaClickCaptcha:
                    "二维码/图形状，描述文字已降噪清晰可读）。"
                    "请在九宫格中选出所有包含该目标图案的格子，返回这些格子中心点在 body 图中的坐标"
                    "（可以多个）。若一个都没有，返回空数组（页面会直接点 Submit）。")
+        grid_comment = ("The instruction image shows the task in Chinese: "
+                        "top line = 'select all pictures matching the description', "
+                        "the pink band describes the target object "
+                        "(e.g. 带蜜蜂的帽子 = hat with a bee). "
+                        "Select ALL cells of the 3x3 grid containing the described "
+                        "object. If none matches, press 'No matching images'.")
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1 and self.solved():
+                # 上一轮其实已通过（僵尸 iframe / 页面进下一步），别再烧题分
+                res.ok = True
+                res.detail = "通过（页面已进下一步）"
+                self._d("通过（重试前检测验证码已通过）")
+                return res
             data = self.capture()
             if data.get("error"):
+                if self.solved():
+                    res.ok = True
+                    res.detail = "通过（页面已进下一步）"
+                    return res
                 res.detail = f"取图失败 {data.get('error')}"
                 return res
 
             png = data_url_to_bytes(data["dataUrl"])
-            # 题面优先用**真实截图**（canvas 导出常是空白/噪点）
-            q_png = self.screenshot_instructions() or (
+            # 题面优先用**真实截图**（canvas 导出常是空白/噪点）；
+            # height=84 只截题干+描述带，不含格子边缘（GridTask 提示图更干净）
+            q_png = self.screenshot_instructions(height=84) or (
                 data_url_to_bytes(data["questionUrl"])
                 if data.get("questionUrl") else None)
             if save_path:
@@ -388,10 +444,21 @@ class BaxiaClickCaptcha:
                     pass
 
             sol = None
+            cells: list[int] = []
             for round_i in range(1, 3):        # 同一张图最多问两次（工人偶发失败）
                 try:
-                    sol = click_client.solve(png, comment,
-                                             img_instructions=q_png)
+                    # 首选 GridTask：工人对编号格子直接答格号，无换算误差
+                    try:
+                        g = click_client.solve_grid(
+                            png, grid_comment, img_instructions=q_png)
+                        cells = [c - 1 for c in g.cells]
+                        sol = g
+                        self._d(f"第 {attempt} 次 GridTask → 格子={cells} "
+                                f"cost=${g.cost:.4f}")
+                    except Exception as gexc:
+                        self._d(f"GridTask 失败回退 Coordinates: {str(gexc)[:60]}")
+                        sol = click_client.solve(png, comment,
+                                                 img_instructions=q_png)
                     break
                 except Exception as exc:
                     msg = str(exc)
@@ -405,11 +472,11 @@ class BaxiaClickCaptcha:
                 return res
 
             res.cost += sol.cost
-            res.points = sol.points
-            cells = points_to_cells(sol.points, data.get("layout") or {})
+            if not cells:
+                res.points = sol.points
+                cells = points_to_cells(sol.points, data.get("layout") or {})
             res.cells = cells
-            self._d(f"第 {attempt} 次: 点={sol.points} → 格子={cells} "
-                    f"cost=${sol.cost:.4f}")
+            self._d(f"第 {attempt} 次: 格子={cells} cost=${sol.cost:.4f}")
 
             clicked = self.click_cells(cells)
             sel = self.selected()
@@ -423,15 +490,22 @@ class BaxiaClickCaptcha:
                     self.click_cells(extra)
                 sel = self.selected()
                 self._d(f"修正后已选 {sel}")
-            time.sleep(0.4)
-            self.click_submit(data.get("submit"))
-
+            # 选中条滑入有布局动画：等稳定再点 submit；
+            # 点完若选中仍在且未通过 = submit 没点中，补点（实测破绽）
+            time.sleep(0.8)
             ok = False
-            for _ in range(16):          # 最多等 8 秒判定结果
-                time.sleep(0.5)
-                if self.solved():
-                    ok = True
+            for sub_try in range(3):
+                self.click_submit(data.get("submit"))
+                for _ in range(10):          # 每轮最多等 5s 判定
+                    time.sleep(0.5)
+                    if self.solved():
+                        ok = True
+                        break
+                if ok:
                     break
+                if sorted(self.selected()) != sorted(cells):
+                    break                    # 选中被清/换题 → 服务端判拒
+                self._d(f"submit 第 {sub_try + 1} 次未生效（选中仍在），补点")
             if ok:
                 res.ok = True
                 res.detail = "通过"
@@ -439,7 +513,7 @@ class BaxiaClickCaptcha:
                 return res
 
             st = self.page.eval(JS_STATE) or {}
-            self._d(f"未通过，页面提示: {st.get('body', '')[:80]}")
+            self._d(f"未通过，页面提示: {st.get('body', '')[:80]} 选中={self.selected()}")
             # 换题：用最新坐标点 refresh
             c2 = self.centers()
             ref = c2.get("refresh")

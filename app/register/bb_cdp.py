@@ -24,8 +24,10 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from app.net.proxy import Proxy
@@ -65,7 +67,7 @@ def _fingerprint_for(region: str, account_tag: str) -> dict:
 
     prof = make_profile(region=region, seed=account_tag or None)
     return build_fingerprint(
-        ua=prof.user_agent,
+        # ua 不传：比特按内核 156 自动生成；时区/语言按出口 IP 生成
         screen_w=prof.viewport_w,
         screen_h=prof.viewport_h,
         timezone=prof.timezone,
@@ -135,11 +137,16 @@ def ensure_env(
 
 def launch_env(client, env_id: str, *, headless: bool = False,
                wait_cdp: float = 25.0) -> tuple[str, Any]:
-    """启动环境并等到 CDP 端点真的可用，返回 ``(endpoint, LaunchResult)``。"""
+    """启动环境并等到 CDP 端点真的可用，返回 ``(endpoint, LaunchResult)``。
+
+    ignoreDefaultUrls=True：不打开客户端默认起始页（否则每次启动
+    多出一堆与任务无关的标签，风控可见）。
+    """
     from app.register.bitbrowser import LaunchRestrictedError
 
     try:
-        res = client.open_env(env_id, headless=headless)
+        res = client.open_env(env_id, headless=headless,
+                              ignore_default_urls=True)
     except LaunchRestrictedError:
         raise
     endpoint = res.cdp_http
@@ -203,3 +210,113 @@ def close_env(client, env_id: str) -> bool:
         return client.close_env(env_id)
     except Exception:  # noqa: BLE001
         return False
+
+
+# ------------------------------------------------------------ 单标签保障
+def find_profile_dir(env_id: str) -> Path | None:
+    """profile 在客户端 browser_cache_dir 下，目录名即环境 id。"""
+    import re
+    import subprocess
+
+    candidates = [Path("D:/bitbrowser-cache") / env_id,
+                  Path.home() / "AppData/Local/BitBrowser" / env_id,
+                  Path.home() / "AppData/Roaming/BitBrowser" / env_id]
+    for c in candidates:
+        if (c / "Default" / "Preferences").exists() or c.is_dir():
+            return c
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+             "Select-Object -ExpandProperty CommandLine"],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace").stdout
+    except Exception:  # noqa: BLE001
+        return None
+    for line in out.splitlines():
+        if "--user-data-dir=" not in line:
+            continue
+        m = re.search(r'--user-data-dir="?([^" ]+)"?', line)
+        if m and env_id in m.group(1):
+            return Path(m.group(1))
+    return None
+
+
+def patch_preferences(profile: Path) -> str:
+    """Chrome 层关会话恢复：restore_on_startup=4 + 清 startup_urls。"""
+    import json
+
+    prefs = profile / "Default" / "Preferences"
+    if not prefs.exists():
+        prefs = profile / "Preferences"
+    if not prefs.exists():
+        return f"没找到 Preferences: {prefs}"
+    try:
+        data = json.loads(prefs.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return f"Preferences 解析失败: {exc}"
+    session = data.setdefault("session", {})
+    session["restore_on_startup"] = 4
+    session["startup_urls"] = []
+    prof = data.setdefault("profile", {})
+    prof.pop("exit_type", None)
+    prof["exited_cleanly"] = True
+    prefs.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return f"{prefs} session={session}"
+
+
+def disable_session_restore(env_id: str) -> str:
+    """环境关闭时修 profile，下次启动不恢复旧标签（含上轮被罚的 qoder 页）。"""
+    profile = find_profile_dir(env_id)
+    if not profile:
+        return "no-profile"
+    return patch_preferences(profile)
+
+
+def close_extra_tabs(endpoint: str) -> int:
+    """只留一个标签（优先空白页），其余全关。返回关掉的数量。"""
+    import urllib.request
+
+    from app.register import cdp_raw
+
+    base = cdp_raw.normalize_base(endpoint)
+    try:
+        with urllib.request.urlopen(base + "/json/list", timeout=10) as resp:
+            targets = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return 0
+    pages = [t for t in targets if t.get("type") == "page"]
+    if len(pages) <= 1:
+        return 0
+    keep = next((t for t in pages
+                 if (t.get("url") or "").strip() in ("", "about:blank")),
+                pages[0])
+    closed = 0
+    for t in pages:
+        if t is keep:
+            continue
+        try:
+            urllib.request.urlopen(
+                base + "/json/close/" + t.get("id", ""), timeout=5).read()
+            closed += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return closed
+
+
+def launch_existing(client, env_name: str) -> BBLaunch | None:
+    """按名字找到环境后**只启动**：不改指纹/不重写代理。
+
+    领取段复用注册窗口的正确姿势：重写代理（尤其直连重写）会换
+    出口 IP 踢掉会话；窗口池的 qpool_XX 与旧 acct{id} 都走这里。
+    找不到返回 None，调用方自行退回建环境逻辑。
+    """
+    env_id = find_env_id(client, env_name)
+    if not env_id:
+        return None
+    endpoint, res = launch_env(client, env_id)
+    return BBLaunch(
+        env_id=env_id, env_name=env_name, endpoint=endpoint,
+        created=False, pid=res.pid, core_version=res.core_version,
+        proxy_label="复用注册环境", proxy_raw="",
+    )

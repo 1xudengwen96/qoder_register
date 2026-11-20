@@ -13,10 +13,15 @@
     ┌── 注册 Worker × N（并行）──┐      ┌── 领取 Worker × 1（串行）──┐
 邮箱池 → 取地址 → 指纹环境 → 注册 → 验证 → 入队 → 出队 → 设备重置 → 领取 → 入库
 
+截止语义：``run(total=N)`` 的 N 是**注册成功目标数**——成功达标即停止取新邮箱，
+领取段把队列排空后自动收尾。用「预约制」保证不超调：
+``registered + in_flight < N`` 才允许发起下一次注册尝试。
+
 关键机制：
 1. ``AccountQueue``：已验证账号的生产者-消费者队列（SQLite 持久化，可断点续跑）
 2. ``DeviceLock``：设备独占锁（跨进程文件锁），防止两个领取 Worker 同时清设备
 3. ``DeviceSlot``：一台机器一个槽位；多机部署时每台机器配不同 slot_id
+4. 进度文件：``data/.run_progress.json`` 实时快照，Web 控制台轮询渲染
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ import queue
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -298,17 +303,18 @@ class WorkerStats:
 
 
 class ConcurrentPipeline:
-    """注册并行 + 领取串行的编排器。
+    """注册并行 + 领取串行的编排器（目标截止制）。
 
     用法：
 
         pipe = ConcurrentPipeline(cfg, register_workers=4)
-        pipe.run(total=100)
+        pipe.run(total=100)   # 注册成功 100 个即停，领取排空队列后收尾
 
     内部结构：
 
-    - ``ThreadPoolExecutor(register_workers)``：跑注册（每个 worker 一个指纹环境）
+    - ``ThreadPoolExecutor(register_workers)``：持续跑注册（每个 worker 一个指纹环境）
     - 主线程：串行跑领取（设备锁 + 客户端单实例）
+    - 进度文件：每次状态变化落盘 JSON，供控制台实时渲染
     """
 
     def __init__(
@@ -318,6 +324,7 @@ class ConcurrentPipeline:
         slot_id: str = "local",
         lock_path: str = "data/.device.lock",
         device_wait: float = 1800,
+        progress_path: str = "data/.run_progress.json",
     ) -> None:
         from app.orchestrator import Pipeline
 
@@ -328,51 +335,127 @@ class ConcurrentPipeline:
         self.queue = AccountQueue(slot_id)
         self.device_lock = DeviceLock(lock_path)
         self.device_wait = device_wait
+        self.progress_path = Path(progress_path)
         self.stats = WorkerStats()
         self._stop = threading.Event()
+        self._user_stop = False
+        self._mail_empty = threading.Event()
         self._stats_lock = threading.Lock()
+        self._target = 0
+        self._in_flight = 0
+        self._finished = False
+        self.stop_reason = ""
+        self.workers_state: list[dict] = []
+
+    # ---------------------------------------------------------- 进度快照
+    def _snapshot(self) -> dict:
+        with self._stats_lock:
+            s = self.stats
+            return {
+                "ts": time.time(),
+                "target": self._target,
+                "workers": self.register_workers,
+                "registered": s.registered,
+                "register_failed": s.register_failed,
+                "claimed": s.claimed,
+                "claim_failed": s.claim_failed,
+                "credits": s.credits,
+                "in_flight": self._in_flight,
+                "pending": self.queue.pending(),
+                "finished": self._finished,
+                "stop_reason": self.stop_reason,
+                "worker_states": [dict(w) for w in self.workers_state],
+            }
+
+    def _write_progress(self) -> None:
+        try:
+            self.progress_path.parent.mkdir(parents=True, exist_ok=True)
+            self.progress_path.write_text(
+                json.dumps(self._snapshot(), ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("进度文件写入失败：%s", exc)
+
+    def _reserve(self) -> bool:
+        """预约一次注册尝试：registered + in_flight < target 才放行（不超调）。"""
+        with self._stats_lock:
+            if self._stop.is_set() or self._mail_empty.is_set():
+                return False
+            if self.stats.registered + self._in_flight < self._target:
+                self._in_flight += 1
+                return True
+            return False
 
     # ---------------------------------------------------------- 注册 Worker
-    def _register_worker(self, index: int, region: str | None) -> list[tuple[int, str]]:
-        """一个注册 worker：取邮箱 → 注册 → 验证 → 入队。返回 (account_id, 结果)。"""
-        results: list[tuple[int, str]] = []
+    def _register_worker(self, index: int, region: str | None) -> None:
+        """持续循环：预约 → 注册 → 验证 → 入队，直到达标/池空/停止。"""
+        ws = self.workers_state[index]
         region = region or get(self.cfg, "region", "us")
         while not self._stop.is_set():
+            if self._mail_empty.is_set():
+                break
+            if not self._reserve():
+                with self._stats_lock:
+                    reached = self.stats.registered >= self._target
+                if reached:
+                    break
+                time.sleep(0.4)  # 等同伴的在途结果（失败会释放预约额度）
+                continue
+
+            ws["busy"] = True
+            ws["phase"] = "registering"
+            self._write_progress()
             try:
                 rep = self.pipe.register_only(region=region, worker=index)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.exception("注册 worker %d 异常", index)
-                results.append((-1, f"exception: {exc}"))
+                with self._stats_lock:
+                    self._in_flight -= 1
+                    self.stats.register_failed += 1
+                ws.update(busy=False, phase="exit", fail=ws["fail"] + 1)
+                self._write_progress()
                 break
 
             if rep.account_id is None and rep.stage == "mail":
                 log.info("注册 worker %d：邮箱池已空，退出", index)
+                with self._stats_lock:
+                    self._in_flight -= 1
+                self._mail_empty.set()
+                ws.update(busy=False, phase="exit")
+                self._write_progress()
                 break
 
+            with self._stats_lock:
+                self._in_flight -= 1
+                if rep.ok:
+                    self.stats.registered += 1
+                    ws["ok"] += 1
+                else:
+                    self.stats.register_failed += 1
+                    ws["fail"] += 1
             if rep.ok:
                 self.queue.put(rep.account_id)
-                with self._stats_lock:
-                    self.stats.registered += 1
-                log.info("worker %d 注册成功 id=%s %s",
-                         index, rep.account_id, rep.email)
-                results.append((rep.account_id, "ok"))
+                log.info("worker %d 注册成功 id=%s %s（%d/%d）",
+                         index, rep.account_id, rep.email,
+                         self.stats.registered, self._target)
             else:
-                with self._stats_lock:
-                    self.stats.register_failed += 1
                 log.warning("worker %d 注册失败 %s: %s",
                             index, rep.stage, rep.message)
-                results.append((rep.account_id or -1, f"{rep.stage}:{rep.message}"))
-            return results
-        return results
+            ws.update(busy=False, phase="idle", last=rep.email or ws["last"])
+            self._write_progress()
+
+        ws.update(busy=False, phase="exit")
+        self._write_progress()
 
     # ---------------------------------------------------------- 领取（串行）
     def _claim_one(self) -> bool:
         """取一个账号，串行领取。返回是否成功。"""
+        if self._stop.is_set():
+            return False
         if not self.device_lock.acquire(timeout=self.device_wait):
             log.error("设备锁等待超时，本轮跳过领取")
             return False
         try:
-            item = self.queue.claim_next(max_wait=60)
+            item = self.queue.claim_next(max_wait=2)
             if item is None:
                 return False
             # 长任务续租
@@ -384,53 +467,75 @@ class ConcurrentPipeline:
                     self.stats.credits += rep.credits
                 else:
                     self.stats.claim_failed += 1
+            self._write_progress()
             return rep.ok
         finally:
             self.device_lock.release()
 
     # ---------------------------------------------------------- 主循环
     def run(self, total: int, region: str | None = None) -> WorkerStats:
-        """跑 total 个账号。注册并行，领取串行。"""
-        log.info("并发流水线启动：注册并发 %d，领取串行，目标 %d 个",
-                 self.register_workers, total)
+        """注册成功 total 个即截止。注册并行，领取串行排空队列。"""
+        self._target = max(1, int(total))
+        self.workers_state = [
+            {"i": i, "busy": False, "phase": "idle", "ok": 0, "fail": 0, "last": ""}
+            for i in range(self.register_workers)
+        ]
+        log.info("并发流水线启动：注册并发 %d，领取串行，注册目标 %d 个",
+                 self.register_workers, self._target)
         self.queue.reclaim_stale()
-
-        produced = 0
-        consumed = 0
+        self._write_progress()
 
         with ThreadPoolExecutor(max_workers=self.register_workers,
                                 thread_name_prefix="reg") as pool:
-            futures = []
-            for i in range(self.register_workers):
-                futures.append(pool.submit(self._register_worker, i, region))
+            futures = [pool.submit(self._register_worker, i, region)
+                       for i in range(self.register_workers)]
 
-            # 边注册边领取
-            while consumed < total:
-                # 先尝试领取（串行，主线程）
+            # 边注册边领取；worker 全退出且队列排空 → 收尾
+            while not self._stop.is_set():
                 if self._claim_one():
-                    consumed += 1
-                    log.info("已领取 %d/%d", consumed, total)
-                else:
-                    # 队列空，等生产
-                    done = [f for f in futures if f.done()]
-                    for f in done:
-                        futures.remove(f)
-                    if not futures and self.queue.pending() == 0:
-                        log.info("注册全部结束且队列为空，停止")
-                        break
-                    time.sleep(2)
+                    log.info("已领取 %d（注册 %d/%d）",
+                             self.stats.claimed, self.stats.registered, self._target)
+                    continue
+                if all(f.done() for f in futures) and self.queue.pending() == 0:
+                    break
+                time.sleep(1.5)
 
             self._stop.set()
-            for f in as_completed(futures, timeout=600):
-                pass
+            for f in futures:
+                try:
+                    f.result(timeout=600)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("worker 收尾异常：%s", exc)
 
-        log.info("完成：注册成功 %d，注册失败 %d，领取成功 %d，领取失败 %d，总积分 %d",
-                 self.stats.registered, self.stats.register_failed,
+        if self._user_stop:
+            self.stop_reason = "stopped"
+        elif self.stats.registered >= self._target:
+            self.stop_reason = "target"
+        elif self._mail_empty.is_set():
+            self.stop_reason = "mail_empty"
+        else:
+            self.stop_reason = "exhausted"
+        self._finished = True
+        self._write_progress()
+        # 进程收尾：关掉全部池窗口（新进程来了再随机开启）
+        shutdown = getattr(self.pipe, "shutdown_browsers", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("窗口池收尾异常：%s", exc)
+        log.info("完成（%s）：注册成功 %d，注册失败 %d，领取成功 %d，领取失败 %d，总积分 %d",
+                 self.stop_reason, self.stats.registered, self.stats.register_failed,
                  self.stats.claimed, self.stats.claim_failed, self.stats.credits)
         return self.stats
 
+    def stop(self) -> None:
+        """外部停止：在途注册跑完当前这一次后退出，领取排空与否立即收尾。"""
+        self._user_stop = True
+        self._stop.set()
+
     def report(self) -> str:
         s = self.stats
-        return (f"注册 {s.registered}（失败 {s.register_failed}） / "
+        return (f"注册 {s.registered}/{self._target}（失败 {s.register_failed}） / "
                 f"领取 {s.claimed}（失败 {s.claim_failed}） / "
                 f"积分 {s.credits} / 队列待领 {self.queue.pending()}")

@@ -153,6 +153,7 @@ QODER_PROCESS_NAMES = ["Qoder.exe", "Qoder", "qoder", "Qoder Helper"]
 
 ALL_STEPS = [
     "kill",              # 结束客户端进程
+    "fresh",             # 整目录清空＝模拟全新设备安装（领新手礼必需）
     "machine_id",        # 机器 ID 文件
     "telemetry",         # storage.json 遥测标识
     "cache",             # 缓存目录
@@ -208,10 +209,38 @@ class QoderIdentityReset:
         logger: logging.Logger | None = None,
         app_dir: str | Path | None = None,
         backup_dir: str | Path = "data/device_backup",
+        client_path: str | Path | None = None,
     ) -> None:
         self.log = logger or logging.getLogger("qoder.reset")
         self.app_dir = Path(app_dir) if app_dir else self.default_app_dir()
         self.backup_dir = Path(backup_dir)
+        self.client_path = Path(client_path) if client_path else None
+
+    def _client_pids(self) -> list[str]:
+        """按安装路径精确匹配被测客户端 PID。
+
+        不能按镜像名/名前缀：Qoder IDE 主进程叫 Qoder IDE.exe、
+        伴随进程也叫 Qoder.exe，按名匹配会把用户 IDE 算进来
+        （误判在跑 + 误杀 IDE，2026-11-19 实测事故）。
+        """
+        if platform.system() != "Windows":
+            return []
+        if self.client_path is not None:
+            install = str(self.client_path.parent)
+        else:
+            install = str(Path(os.environ.get(
+                "LOCALAPPDATA", Path.home() / "AppData/Local"))
+                / "Programs" / "Qoder")
+        install = install.replace("'", "''")
+        cmd = ("Get-CimInstance Win32_Process | Where-Object { "
+               f"$_.ExecutablePath -like '{install}\\*' }} | "
+               "ForEach-Object { $_.ProcessId }")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                                 capture_output=True, text=True, timeout=20)
+            return [x for x in (out.stdout or "").split() if x.strip().isdigit()]
+        except Exception:  # noqa: BLE001
+            return []
 
     # ---------------------------------------------------------- 路径
     @staticmethod
@@ -277,29 +306,15 @@ class QoderIdentityReset:
         pids: list[str] = []
         system = platform.system()
         if system == "Windows":
-            try:
-                out = subprocess.run(
-                    ["tasklist", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, timeout=20,
-                    encoding="gbk", errors="replace",
-                )
-                for line in (out.stdout or "").splitlines():
-                    parts = line.split(",")
-                    if len(parts) < 2:
-                        continue
-                    name = parts[0].strip('"')
-                    if name.lower().startswith("qoder"):
-                        pids.append(parts[1].strip('"'))
-            except Exception:
-                pass
-        else:
-            try:
-                out = subprocess.run(["pgrep", "-f", "Qoder"],
-                                     capture_output=True, text=True, timeout=20)
-                if out.returncode == 0:
-                    pids = [p for p in out.stdout.split() if p]
-            except Exception:
-                pass
+            cp = self._client_pids()
+            return bool(cp), cp
+        try:
+            out = subprocess.run(["pgrep", "-f", "Qoder"],
+                                 capture_output=True, text=True, timeout=20)
+            if out.returncode == 0:
+                pids = [p for p in out.stdout.split() if p]
+        except Exception:
+            pass
         return bool(pids), pids
 
     def kill_qoder(self, opts: ResetOptions, report: ResetReport) -> None:
@@ -312,14 +327,22 @@ class QoderIdentityReset:
             report.actions.append("[dry] 将结束 Qoder 进程树")
             return
         system = platform.system()
-        for name in QODER_PROCESS_NAMES:
-            cmd = (["taskkill", "/F", "/IM", name, "/T"] if system == "Windows"
-                   else ["pkill", "-f", name])
-            try:
-                subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=opts.timeout_kill)
-            except Exception:
-                continue
+        if system == "Windows":
+            for pid in self._client_pids():
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", pid, "/T"],
+                                   capture_output=True, text=True,
+                                   timeout=opts.timeout_kill)
+                except Exception:
+                    continue
+        else:
+            for name in QODER_PROCESS_NAMES:
+                try:
+                    subprocess.run(["pkill", "-f", name],
+                                   capture_output=True, text=True,
+                                   timeout=opts.timeout_kill)
+                except Exception:
+                    continue
         for _ in range(opts.timeout_kill):
             if not self.is_running()[0]:
                 report.actions.append("kill: 已结束")
@@ -495,6 +518,27 @@ class QoderIdentityReset:
         data.update(self._system_fingerprint(opts))
         self._dump_json(self.storage_json, data, opts, report)
 
+    def step_fresh_install(self, opts: ResetOptions, report: ResetReport) -> None:
+        """整目录清空＝模拟全新设备安装。
+
+        部分删除会留下 main.sqlite/sessionMigration/qoder-data.v1.json
+        等安装痕迹，客户端/服务端仍认旧安装→新手礼不发放
+        （用户 2026-11-19 确认：必须重置成全新安装才能领取成功）。
+        清空后客户端首启自建目录，后续步骤往空目录写新身份文件。
+        """
+        if not self.app_dir.exists():
+            report.actions.append("fresh: 数据目录不存在，视为全新")
+            return
+        if opts.dry_run:
+            report.actions.append(f"[dry] rmtree {self.app_dir}")
+            return
+        try:
+            shutil.rmtree(self.app_dir)
+            report.actions.append(
+                f"fresh: 整目录清空 {self.app_dir.name}（模拟全新安装）")
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(f"fresh 清空失败: {exc}")
+
     def step_cache(self, opts: ResetOptions, report: ResetReport) -> None:
         for name in CACHE_DIRS:
             self._rm(self.app_dir / name, opts, report)
@@ -556,6 +600,13 @@ class QoderIdentityReset:
             if p.exists():
                 self._rm(p, opts, report)
                 report.actions.append(f"login: 清除 {name}")
+        # 0.5.x：新手身份卡/onboarding 状态（权益跟卡号绑定，实测残留
+        # first-launch-onboarding.v1.json 会让新号被判「本机已领新手礼」→ Free）
+        for pat in ("first-launch-onboarding*.json", "*onboarding*.v1.json",
+                    "auth-profile-overlays*.dat"):
+            for p in self.app_dir.glob(pat):
+                self._rm(p, opts, report)
+                report.actions.append(f"login: 清除 {p.name}")
 
     def step_hardware(self, opts: ResetOptions, report: ResetReport) -> None:
         if opts.profile is not None:
@@ -714,6 +765,7 @@ class QoderIdentityReset:
 
         step_map = {
             "kill": lambda: self.kill_qoder(opts, report),
+            "fresh": lambda: self.step_fresh_install(opts, report),
             "machine_id": lambda: self.step_machine_id(opts, report),
             "telemetry": lambda: self.step_telemetry(opts, report),
             "cache": lambda: self.step_cache(opts, report),

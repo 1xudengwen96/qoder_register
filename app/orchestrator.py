@@ -95,12 +95,12 @@ class Pipeline:
         self.cdp_registrar = None
         self.use_cdp = bool(get(cfg, "browser.cdp_mode", backend == "bitbrowser"))
         if self.use_cdp:
+            from app.register.bitbrowser import resolve_base
             from app.register.cdp_registrar import CDPRegistrar
 
             self.cdp_registrar = CDPRegistrar(
                 cfg,
-                api_base=get(cfg, "browser.bitbrowser.api_base",
-                             "http://127.0.0.1:54345"),
+                api_base=resolve_base(cfg),
                 group_id=(get(cfg, "browser.bitbrowser.group_id", "") or None),
                 env_id=get(cfg, "browser.bitbrowser.env_id", "") or "",
                 reuse_env=bool(get(cfg, "browser.bitbrowser.reuse_env", False)),
@@ -113,7 +113,24 @@ class Pipeline:
                 headless=bool(get(cfg, "browser.bitbrowser.headless", False)),
                 keep_open=bool(get(cfg, "browser.bitbrowser.keep_open", False)),
                 logger=log,
+                manual_captcha=bool(get(cfg, "captcha.manual", False)),
+                manual_timeout=int(get(cfg, "captcha.manual_timeout", 600)),
+                manual_otp=bool(get(cfg, "captcha.manual_otp", False)),
+                manual_form=bool(get(cfg, "captcha.manual_form", False)),
             )
+
+        # 窗口池（2026-11-18）：固定 N 个带标识的比特窗口循环复用，
+        # 每用一次重配指纹+新代理+清残留；开关 browser.env_pool.enabled。
+        # 旧逻辑（每号新建 acct{id}）备份在 data/logic_backup_20261118。
+        self.env_pool = None
+        if self.cdp_registrar is not None:
+            from app.register.bb_pool import build_env_pool
+
+            self.env_pool = build_env_pool(cfg, self.cdp_registrar.client)
+            self.cdp_registrar.env_pool = self.env_pool
+            if self.env_pool is not None:
+                log.info("窗口池已启用：固定 %d 个 %s* 窗口循环复用",
+                         self.env_pool.size, self.env_pool.prefix)
 
         self.verifier = Verifier(
             mail_layer=self.mail_layer,
@@ -124,6 +141,7 @@ class Pipeline:
             logger=log,
             app_dir=get(cfg, "device.app_dir", None),
             backup_dir=get(cfg, "device.backup_dir", "data/device_backup"),
+            client_path=get(cfg, "claim.client_path", "") or None,
         )
         # 领取登录模式：inherit（默认，继承已有登录态，无人值守）/ cdp
         # （半自动：人点一次客户端「登录」，拿链接之后 wait_link →
@@ -176,13 +194,25 @@ class Pipeline:
                     row.used_at = datetime.now()
 
     # ------------------------------------------------------------ 代理分配
+    @property
+    def _proxy_enabled(self) -> bool:
+        """代理总开关：false = 全链路直连（比特环境 proxyMethod=3，
+        QQ IMAP 收信本就直连，不受此开关影响）。"""
+        return bool(get(self.cfg, "proxy.enabled", True))
+
     def _acquire_proxy(self, region: str | None = None, env_tag: str = "") -> object | None:
         """给这次开窗口取**一条没用过**的代理；池子空了就按模板续期。
 
         新逻辑（优先）：``data/ip.txt``（ip:port:user:password）→ ipdeep extract_url
         兜底；region 只允许 sg/us。详见 ``proxy.acquire_for_browser``。
         拿不到再走原来的 ProxyPool + acquire_once 链路。
+
+        ``proxy.enabled=false`` 时直接返回 ``None``（直连模式，
+        注册窗口不带代理、用本机出口 IP）。
         """
+        if not self._proxy_enabled:
+            return None
+
         from app.net.proxy import acquire_for_browser, acquire_once
 
         # ① 新逻辑：ip.txt（消耗式）→ ipdeep 兜底（只 us/sg）
@@ -284,6 +314,23 @@ class Pipeline:
             return None
 
     # ------------------------------------------------------------ 领取登录
+    def _claim_env_name(self, account_id: int) -> str:
+        """领取段用哪个窗口：池化后查 账号→窗口 映射（qpool_XX），
+        没启用池/没记录时退回旧逻辑 acct{id}。"""
+        pool = getattr(self, "env_pool", None)
+        if pool is not None:
+            name = pool.env_name_for(f"acct{account_id}")
+            if name:
+                return name
+        return f"acct{account_id}"
+
+    def shutdown_browsers(self) -> None:
+        """进程收尾：关掉全部池窗口（用户设计：任务进程结束就关浏览器，
+        新进程来了再随机开启）。profile 存盘，Cookie 不丢。"""
+        pool = getattr(self, "env_pool", None)
+        if pool is not None:
+            pool.close_all()
+
     def _claim_ui_login(self, email_addr: str, password: str, account_id: int):
         """领取段的登录动作，返回 (回调, state)。
 
@@ -300,9 +347,9 @@ class Pipeline:
 
             ui, state = make_ui_login(
                 self.cfg, email_addr, password,
-                # 一一对应：复用注册环境 acct{id}（同指纹/代理/IP，注册
-                # cookie 还在，selectAccounts 免密授权），不再另建 login 环境
-                env_name=f"acct{account_id}",
+                # 一一对应：复用注册窗口（池化后是 qpool_XX，同指纹/代理/IP，
+                # 注册 cookie 还在，selectAccounts 免密授权），不再另建 login 环境
+                env_name=self._claim_env_name(account_id),
                 region=get(self.cfg, "region", "us"),
                 link_timeout=int(get(self.cfg, "claim.link_timeout", 180)),
                 login_timeout=int(get(self.cfg, "claim.login_timeout", 300)),
@@ -322,7 +369,7 @@ class Pipeline:
         if cres.ok and cres.credits <= 0:
             src = apply_credits_fallback(
                 cres, login_state, self.cfg,
-                env_name=f"acct{account_id}",
+                env_name=self._claim_env_name(account_id),
                 region=get(self.cfg, "region", "us"),
             )
             if src and cres.credits > 0:
@@ -370,9 +417,12 @@ class Pipeline:
                     {"provider": ident.provider, "worker": worker}, mail_id)
 
         proxy = self._acquire_proxy(region=region, env_tag=f"acct{account_id}")
-        if proxy is None:
+        if proxy is None and self._proxy_enabled:
             self._fail(account_id, "proxy", "代理池无可用出口")
             return RunReport(False, account_id, email_addr, "proxy", "代理池无可用出口")
+        if proxy is None:
+            self._event(account_id, "proxy", "info",
+                        "代理开关关闭，注册窗口直连（本机出口 IP）")
 
         mident = MailIdent(
             address=ident.address, provider=ident.provider,
@@ -388,7 +438,8 @@ class Pipeline:
             if reg.kind == "email_conflict" and ident.provider == "outlook_tag":
                 self._flag(account_id, "tag_normalized")
             elif reg.kind == "rate_limited":
-                self.proxies.mark_banned(proxy)
+                if proxy is not None:
+                    self.proxies.mark_banned(proxy)
                 self._flag(account_id, "proxy_dirty")
             self._fail(account_id, "register", f"{reg.kind}: {reg.error}")
             return RunReport(False, account_id, email_addr, "register",
@@ -397,7 +448,7 @@ class Pipeline:
         with session_scope() as s:
             a = s.get(Account, account_id)
             a.state = AccountState.REGISTERED
-            a.register_ip = proxy.exit_ip_hint
+            a.register_ip = proxy.exit_ip_hint if proxy is not None else "direct"
 
         # CDP 通道在注册内部就完成了邮箱验证（6 位码），不再等确认链接
         if self.cdp_registrar is None:
@@ -470,28 +521,34 @@ class Pipeline:
             device_lock.refresh()
 
         cres = self._claim_with_fallback(email_addr, password, account_id)
-        if not cres.ok:
-            self._release(prof_id)
-            self._fail(account_id, "claim", cres.error)
-            return RunReport(False, account_id, email_addr, "claim", cres.error)
+        try:
+            if not cres.ok:
+                self._release(prof_id)
+                self._fail(account_id, "claim", cres.error)
+                return RunReport(False, account_id, email_addr, "claim", cres.error)
 
-        with session_scope() as s:
-            a = s.get(Account, account_id)
-            a.state = AccountState.STOCK
-            a.credits = cres.credits
-            a.plan = cres.plan
-            a.trial_expire_at = cres.expire_at or (datetime.now() + timedelta(days=14))
-            a.claimed_at = datetime.now()
-            if cres.token:
-                a.token_json = json.dumps(cres.token, ensure_ascii=False)
-            prof = s.get(DeviceProfile, prof_id)
-            if prof:
-                prof.claim_count += 1
-            summary = StockManager(s).summary()
+            with session_scope() as s:
+                a = s.get(Account, account_id)
+                a.state = AccountState.STOCK
+                a.credits = cres.credits
+                a.plan = cres.plan
+                a.trial_expire_at = cres.expire_at or (datetime.now() + timedelta(days=14))
+                a.claimed_at = datetime.now()
+                if cres.token:
+                    a.token_json = json.dumps(cres.token, ensure_ascii=False)
+                prof = s.get(DeviceProfile, prof_id)
+                if prof:
+                    prof.claim_count += 1
+                summary = StockManager(s).summary()
 
-        self._event(account_id, "claim", "info",
-                    f"领取 {cres.credits} Credits / {cres.plan}；{summary}")
-        return RunReport(True, account_id, email_addr, "claim", "claimed", cres.credits)
+            self._event(account_id, "claim", "info",
+                        f"领取 {cres.credits} Credits / {cres.plan}；{summary}")
+            return RunReport(True, account_id, email_addr, "claim", "claimed", cres.credits)
+        finally:
+            # 领取完成（无论成败）：注册窗口关窗回池，解除占用锁定
+            pool = getattr(self, "env_pool", None)
+            if pool is not None:
+                pool.finish_claim(f"acct{account_id}")
 
     # ------------------------------------------------------------ 单轮（串行全流程）
     def run_one(self, region: str | None = None, dry_run_device: bool = False) -> RunReport:
@@ -562,9 +619,12 @@ class Pipeline:
 
         # 代理
         proxy = self._acquire_proxy(region=region, env_tag=f"acct{account_id}")
-        if proxy is None:
+        if proxy is None and self._proxy_enabled:
             self._fail(account_id, "proxy", "代理池无可用出口")
             return RunReport(False, account_id, email_addr, "proxy", "代理池无可用出口")
+        if proxy is None:
+            self._event(account_id, "proxy", "info",
+                        "代理开关关闭，注册窗口直连（本机出口 IP）")
 
         # ② + ③ 指纹浏览器注册
         mident = MailIdent(
@@ -584,7 +644,8 @@ class Pipeline:
                             "疑似 +tag 被归一化，建议降权 outlook_tag",
                             {"screenshot": reg.screenshot})
             elif reg.kind == "rate_limited":
-                self.proxies.mark_banned(proxy)
+                if proxy is not None:
+                    self.proxies.mark_banned(proxy)
                 self._flag(account_id, "proxy_dirty")
             self._fail(account_id, "register", f"{reg.kind}: {reg.error}")
             return RunReport(False, account_id, email_addr, "register",
@@ -593,7 +654,7 @@ class Pipeline:
         with session_scope() as s:
             a = s.get(Account, account_id)
             a.state = AccountState.REGISTERED
-            a.register_ip = proxy.exit_ip_hint
+            a.register_ip = proxy.exit_ip_hint if proxy is not None else "direct"
         self._event(account_id, "register", "info",
                     f"注册成功（打码 {reg.used_captcha or '无'}，耗时 {reg.elapsed:.1f}s）",
                     {"screenshot": reg.screenshot, "url": reg.page_url})
@@ -648,6 +709,9 @@ class Pipeline:
 
         # ⑥ 领取（claim.login_mode=cdp 时半自动：人点一次客户端「登录」）
         cres = self._claim_with_fallback(email_addr, password, account_id)
+        pool = getattr(self, "env_pool", None)
+        if pool is not None:
+            pool.finish_claim(f"acct{account_id}")
         if not cres.ok:
             self._release(prof_id)
             self._fail(account_id, "claim", cres.error)

@@ -125,6 +125,9 @@ def cmd_mail_pool(args) -> int:
 # ---------------------------------------------------------------- 浏览器/打码自检
 def cmd_env_check(args) -> int:
     cfg = load_config(args.config)
+    # 常驻收信进程：自检时拉起，outlook/hotmail 长连接保持在线
+    from app.mail import watcher
+    print(f"常驻收信进程 pid={watcher.ensure_watcher()}")
     from app.net.captcha_solver import build_solver
     from app.register.fingerprint_engine import build_fingerprint_engine
 
@@ -214,10 +217,48 @@ def cmd_run_one(args) -> int:
     create_all()
     from app.orchestrator import Pipeline
 
-    rep = Pipeline(cfg).run_one(region=args.region, dry_run_device=args.dry_run_device)
+    pipe = Pipeline(cfg)
+    try:
+        rep = pipe.run_one(region=args.region, dry_run_device=args.dry_run_device)
+    finally:
+        pipe.shutdown_browsers()
     print(json.dumps({
         "ok": rep.ok, "account_id": rep.account_id, "email": rep.email,
         "stage": rep.stage, "message": rep.message, "credits": rep.credits,
+        "captcha": rep.captcha_provider,
+    }, ensure_ascii=False, indent=2))
+    return 0 if rep.ok else 2
+
+
+# ---------------------------------------------------------------- 人工接管
+def cmd_manual_go(args) -> int:
+    """人工模式接管通知：写入 data/.manual_go，等待中的注册流程即继续。"""
+    p = Path("data/.manual_go")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(time.time()), encoding="utf-8")
+    print("已写入接管通知 data/.manual_go；等待中的【人工模式】流程将继续")
+    return 0
+
+
+def cmd_reg_one(args) -> int:
+    """只跑注册+邮箱验证（单窗口测试用）：不碰设备、不碰客户端。
+
+    与 run:one 的区别：到 verified 就停，不跑设备重置和领取，
+    适合链路调试时单窗口验证注册段改动。
+    """
+    cfg = load_config(args.config)
+    init_engine(get(cfg, "storage.url", "sqlite:///data/qoder.db"))
+    create_all()
+    from app.orchestrator import Pipeline
+
+    pipe = Pipeline(cfg)
+    try:
+        rep = pipe.register_only(region=args.region)
+    finally:
+        pipe.shutdown_browsers()
+    print(json.dumps({
+        "ok": rep.ok, "account_id": rep.account_id, "email": rep.email,
+        "stage": rep.stage, "message": rep.message,
         "captcha": rep.captcha_provider,
     }, ensure_ascii=False, indent=2))
     return 0 if rep.ok else 2
@@ -229,7 +270,11 @@ def cmd_run_loop(args) -> int:
     create_all()
     from app.orchestrator import Pipeline
 
-    reps = Pipeline(cfg).run_loop(args.n, args.sleep)
+    pipe = Pipeline(cfg)
+    try:
+        reps = pipe.run_loop(args.n, args.sleep)
+    finally:
+        pipe.shutdown_browsers()
     ok = sum(1 for r in reps if r.ok)
     print(f"共 {len(reps)} 轮，成功 {ok}，失败 {len(reps) - ok}")
     return 0
@@ -260,6 +305,33 @@ def cmd_run_concurrent(args) -> int:
     print(f"领取成功 {stats.claimed}，失败 {stats.claim_failed}")
     print(f"总积分 {stats.credits}")
     print(f"队列待领 {pipe.queue.pending()}")
+    return 0
+
+
+def cmd_pool_status(args) -> int:
+    """窗口池状态：探测/补齐/占用一览（--ensure 不足时补齐）。"""
+    cfg = load_config(args.config)
+    from app.register.bb_pool import build_env_pool
+    from app.register.bitbrowser import BitBrowserClient, resolve_base
+
+    client = BitBrowserClient(resolve_base(cfg))
+    pool = build_env_pool(cfg, client)
+    if pool is None:
+        print("窗口池未启用（browser.env_pool.enabled=false，走每号新建旧逻辑）")
+        return 0
+    if args.ensure:
+        pool.ensure()
+    if args.close:
+        print(f"已关闭 {pool.close_all()} 个池窗口")
+    print(json.dumps(pool.status(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_web(args) -> int:
+    """启动 Web 控制台（配置/状态/启停机器人）。"""
+    from app.webui import serve
+
+    serve(port=args.port)
     return 0
 
 
@@ -362,6 +434,16 @@ def cmd_stats(args) -> int:
 
 
 # ---------------------------------------------------------------- 邮箱清单体检
+def cmd_mail_watch(args) -> int:
+    """常驻收信进程前台运行；--stop 杀掉已有进程。"""
+    from app.mail import watcher
+    if args.stop:
+        print(f"已停止常驻收信进程 pid={watcher.stop_watcher()}")
+        return 0
+    watcher.run_watcher()
+    return 0
+
+
 def cmd_mail_file(args) -> int:
     """体检/入库 data/emails.txt（email----pass----clientId----refreshToken）。"""
     cfg = load_config(args.config)
@@ -708,10 +790,10 @@ def cmd_browser_probe(args) -> int:
         print(f"- 粘性会话: {px.session}"
               f"{f'（{px.sticky_minutes} 分钟）' if px.sticky_minutes else ''}")
 
-    api_base = get(cfg, "browser.bitbrowser.api_base", "http://127.0.0.1:54345")
-    client = BitBrowserClient(api_base)
+    from app.register.bitbrowser import resolve_base
+    client = BitBrowserClient(resolve_base(cfg))
     ok, detail = (client.health(), "OK") if client.is_port_open() else (False, "端口未监听")
-    print(f"\n=== 比特浏览器 ===\n- {api_base} {'OK' if ok else detail}")
+    print(f"\n=== 比特浏览器 ===\n- {client.base} {'OK' if ok else detail}")
     if not ok:
         return 2
 
@@ -771,6 +853,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("mail:pool", help="邮箱池健康与库存")
     s.set_defaults(func=cmd_mail_pool)
+
+    s = sub.add_parser("mail:watch", help="常驻收信进程（outlook/hotmail 长连接）")
+    s.add_argument("--stop", action="store_true", help="停止常驻收信进程")
+    s.set_defaults(func=cmd_mail_watch)
 
     s = sub.add_parser("mail:file",
                        help="体检/入库 data/emails.txt（email----pass----clientId----refreshToken）")
@@ -847,18 +933,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="设备重置只预演不执行")
     s.set_defaults(func=cmd_run_one)
 
+    s = sub.add_parser("reg:one", help="只跑注册+邮箱验证（单窗口调试，不碰设备/客户端）")
+    s.add_argument("--region", default=None)
+    s.set_defaults(func=cmd_reg_one)
+
+    s = sub.add_parser("manual:go", help="人工接管通知：通知等待中的注册流程继续")
+    s.set_defaults(func=cmd_manual_go)
+
     s = sub.add_parser("run:loop", help="批量跑（全串行）")
     s.add_argument("--n", type=int, default=10)
     s.add_argument("--sleep", type=int, default=90)
     s.set_defaults(func=cmd_run_loop)
 
     s = sub.add_parser("run:concurrent", help="注册并行 + 领取串行")
-    s.add_argument("--total", type=int, default=50, help="目标账号数")
+    s.add_argument("--total", type=int, default=50, help="注册成功目标数（达标自动截止）")
     s.add_argument("--workers", type=int, default=3, help="注册并发数（建议 3~5）")
     s.add_argument("--region", default=None)
     s.add_argument("--slot", default="local", help="机器槽位标识，多机部署时每台不同")
     s.add_argument("--lock", default="data/.device.lock")
     s.set_defaults(func=cmd_run_concurrent)
+
+    s = sub.add_parser("pool:status", help="比特窗口池状态（探测/补齐/占用）")
+    s.add_argument("--ensure", action="store_true", help="不足 size 时补齐池窗口")
+    s.add_argument("--close", action="store_true", help="关掉全部池窗口并清占用账本")
+    s.set_defaults(func=cmd_pool_status)
+
+    s = sub.add_parser("web", help="启动 Web 控制台（前端配置 + 启停机器人）")
+    s.add_argument("--port", type=int, default=8877)
+    s.set_defaults(func=cmd_web)
 
     s = sub.add_parser("queue", help="查看/维护待领队列")
     s.add_argument("--slot", default="local")

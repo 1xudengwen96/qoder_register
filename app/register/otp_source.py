@@ -93,6 +93,8 @@ def outlook_code_source(
         return None
 
     def _provider() -> str:
+        # 截止从首次真正取码起算：构造到调用之间可能隔了人工滑块
+        # 接管等待（实测 677s），构造时定死 deadline 会让收码秒退空串
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -120,7 +122,7 @@ def layer_code_source(
     ident,
     *,
     timeout: int = 240,
-    poll: int = 6,
+    poll: int = 3,
 ) -> CodeSource | None:
     """从邮箱池聚合层造取码器。"""
     if mail_layer is None or ident is None:
@@ -128,7 +130,6 @@ def layer_code_source(
     from app.mail.code_extract import extract_code, is_qoder_mail
     from app.mail.base import MailMessage
 
-    deadline = time.time() + timeout
     seen: set[str] = set()
 
     def _match(msg: MailMessage) -> bool:
@@ -137,6 +138,9 @@ def layer_code_source(
         return is_qoder_mail(msg.sender, msg.subject, msg.body_text)
 
     def _provider() -> str:
+        # 截止从首次真正取码起算：构造到调用之间可能隔了人工滑块
+        # 接管等待（实测 677s），构造时定死 deadline 会让收码秒退空串
+        deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 msg = mail_layer.wait_for_mail(
@@ -146,6 +150,7 @@ def layer_code_source(
             except Exception as exc:  # noqa: BLE001
                 log.warning("池子取信异常：%s: %s", type(exc).__name__, exc)
                 msg = None
+                time.sleep(2)   # 异常（如认证被拒）不 sleep 会高频空转轰 IMAP
             if msg is None:
                 continue
             seen.add(msg.uid)
@@ -160,6 +165,33 @@ def layer_code_source(
                       target=getattr(ident, "address", ""))
 
 
+def watcher_code_source(address: str, timeout: int = 240) -> CodeSource:
+    """只等常驻收信进程的命中事件（1s 粒度），不临时连邮箱。"""
+    from app.db import session_scope
+    from app.models import MailCodeEvent
+
+    start = time.time()
+    addr = address.strip().lower()
+
+    def _provider() -> str:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with session_scope() as s:
+                row = (s.query(MailCodeEvent)
+                       .filter(MailCodeEvent.address == addr,
+                               MailCodeEvent.consumed == False,  # noqa: E712
+                               MailCodeEvent.ts >= start - 120)
+                       .order_by(MailCodeEvent.ts.desc()).first())
+                if row is not None:
+                    row.consumed = True
+                    log.info("watcher 事件取码 %s code=%s", addr, row.code)
+                    return row.code
+            time.sleep(1)
+        return ""
+
+    return CodeSource(_provider, kind="mail_watcher", target=address)
+
+
 def make_code_source(
     cfg=None,
     *,
@@ -169,7 +201,10 @@ def make_code_source(
     timeout: int = 240,
     imap_proxy: str | None = None,
 ) -> CodeSource | None:
-    """按优先级造取码器：清单文件 > 邮箱池。"""
+    """按优先级造取码器：常驻收信事件 > 清单文件 > 邮箱池。"""
+    from app.mail import watcher
+    if email and watcher.watcher_alive() and watcher.covers(email):
+        return watcher_code_source(email, timeout=timeout)
     path = ""
     try:
         from app import secrets

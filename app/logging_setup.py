@@ -1,8 +1,13 @@
-"""统一日志：控制台 + 按天滚动文件。"""
+"""统一日志：控制台 + 按天滚动文件。
+
+文件名带进程 PID：控制台与机器人子进程同时运行时各写各的，
+避免共用 run.log 时轮转改名被另一进程句柄锁住（WinError 32）。
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -25,7 +30,7 @@ def setup(level: str = "INFO", log_dir: str | Path = "data/logs", name: str = "q
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
-    fh = TimedRotatingFileHandler(d / "run.log", when="midnight",
+    fh = TimedRotatingFileHandler(d / f"run-{os.getpid()}.log", when="midnight",
                                   backupCount=14, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)

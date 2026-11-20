@@ -13,10 +13,10 @@
       → 我们从该文件抓 token
 
 能自动的部分：打开链接、填邮箱密码、取验证码、捕捉 qoder:// 回跳、拉起客户端回调、抓 token。
-不能自动的部分：**第一次点「登录」按钮**——客户端的 Electron 没开渲染层可见性
-（UIA 树里只有一个 Chrome_WidgetWin_1），也不接受 --remote-debugging-port，
-所以那一下要么人手点，要么按窗口坐标点（分辨率一变就错）。本模块选择让人点一次，
-链接拿到之后全流程无人值守。
+「登录」按钮：旧版客户端需人手点一次；2026-11-19 实测新版客户端接受
+--remote-debugging-port（cdp 模式），auto_click_client_login 可经客户端
+自身 CDP 自动点「立即登录」+「复制登录链接」，实现全程无人值守；
+失败自动回退人工点一次提示。
 
 链接来源按优先级：
 1. 剪贴板（点了「复制登录链接」）
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import json
 import logging
 import os
 import re
@@ -38,6 +39,13 @@ import time
 from pathlib import Path
 
 log = logging.getLogger("claim.login")
+# 挂进项目日志树，否则领取进度在 run-*.log / 控制台不可见
+log.propagate = False
+_parent = logging.getLogger("qoder_register")
+if not log.handlers:
+    for _h in _parent.handlers:
+        log.addHandler(_h)
+log.setLevel(_parent.level or logging.INFO)
 
 LINK_RE = re.compile(r"https://(?:www\.)?qoder\.com/device/selectAccounts\?[^\s\"'<>]+",
                      re.I)
@@ -241,6 +249,10 @@ def _solve_slider(page, cfg, proxy_raw: str | None) -> str:
             log.info("2Captcha 余额 %.4f", paid.balance())
         except Exception as exc:  # noqa: BLE001
             log.warning("余额查询失败（继续）：%s", exc)
+    # 超级鹰试验通道：启用时优先，API 异常自动回退 2Captcha
+    from app.net.chaojiying import build_slider_paid
+
+    paid = build_slider_paid(paid)
     solver = AliyunSliderCDP(page, human=True, paid_client=paid,
                              prefer_paid=paid is not None, proxy=proxy_raw)
     res = solver.solve(max_attempts=4)
@@ -272,18 +284,14 @@ def drive_login(
         回跳             qoder://…          → 拿到深链
     """
     from app.register import bb_cdp
-    from app.register.bitbrowser import BitBrowserClient
+    from app.register.bitbrowser import BitBrowserClient, resolve_base
     from app.register.cdp_page import new_page
 
     out = LoginOutcome(False, link=link)
     artifacts = Path(artifacts_dir)
     artifacts.mkdir(parents=True, exist_ok=True)
 
-    api_base = "http://127.0.0.1:54345"
-    if cfg is not None:
-        from app.config import get
-        api_base = get(cfg, "browser.bitbrowser.api_base", api_base)
-    client = BitBrowserClient(api_base)
+    client = BitBrowserClient(resolve_base(cfg))
     launch = None
     page = None
     proxy_raw = getattr(proxy, "raw", None)
@@ -302,14 +310,38 @@ def drive_login(
             log.info("复用环境 %s（注册一一对应，代理不改写）cdp=%s",
                       env_name, endpoint)
         else:
-            launch = bb_cdp.open_for_register(
-                client, proxy=proxy, region=region,
-                env_name=env_name, reuse_env=True,
-            )
+            try:
+                launch = bb_cdp.open_for_register(
+                    client, proxy=proxy, region=region,
+                    env_name=env_name, reuse_env=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 新建/重配被拒（环境上限等）：回退任一现有池窗，
+                # 无会话 cookie 时状态机会走邮箱+密码登录分支
+                log.warning("登录窗创建/复用失败（%s），回退现有池窗", exc)
+                envs, _ = client.list_envs(page=0, page_size=200)
+                cand = next((e for e in envs
+                             if (e.name or "").startswith("qpool_")), None)
+                if cand is None:
+                    raise
+                endpoint, res = bb_cdp.launch_env(client, cand.id)
+                launch = bb_cdp.BBLaunch(
+                    env_id=cand.id, env_name=cand.name, endpoint=endpoint,
+                    created=False, pid=res.pid,
+                    core_version=res.core_version,
+                    proxy_label="回退池窗", proxy_raw="",
+                )
         out.env_id = launch.env_id
         log.info("登录窗口 env=%s cdp=%s 代理=%s", launch.env_name,
                  launch.endpoint, launch.proxy_label)
         page = new_page(launch.endpoint, "about:blank")
+        # 填表走 OS 级真实输入（与注册段同一套反检测对策）
+        try:
+            from app.register.os_input import OSInput
+
+            page.os_input = OSInput(page, launch.pid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("OS 输入器初始化异常（用 CDP 注入）：%s", exc)
         page.goto(link, wait_ms=4000)
 
         deadline = time.time() + timeout
@@ -328,6 +360,17 @@ def drive_login(
                 out.deep_link = deep
                 out.ok = True
                 out.final_url = url
+                break
+
+            # 授权完成贺屏：URL 仍停在 selectAccounts、无 anchor，
+            # 但正文已「登录成功/一切就绪」（实测 2026-11-19），
+            # 客户端经协议回跳/轮询完成绑定——认正文为成功信号
+            if any(k in text for k in ("登录成功", "一切就绪", "返回 Qoder",
+                                       "Login successful", "You're all set",
+                                       "all set")):
+                out.ok = True
+                out.final_url = url
+                log.info("授权页显示登录成功，客户端绑定生效")
                 break
 
             if url and "users/sign-in" not in url and "users/sign-up" not in url \
@@ -517,6 +560,239 @@ def dispatch_deep_link(deep_link: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------ 客户端自动点登录
+JS_CLIENT_CLICK_LOGIN = """(() => {
+  const els = Array.from(document.querySelectorAll('button,a,[role=button]'));
+  const txt = (e) => (e.innerText || '').trim();
+  let hit = els.find(e => ['立即登录', 'log in', 'sign in', 'login']
+    .includes(txt(e).toLowerCase()));
+  if (!hit) hit = els.find(e => {
+    const t = txt(e).toLowerCase();
+    return t.includes('登录') && !t.includes('反馈') && !t.includes('无法');
+  });
+  if (!hit) return {clicked: false};
+  hit.click();
+  return {clicked: true, text: txt(hit)};
+})()"""
+
+JS_CLIENT_COPY_LINK = """(() => {
+  const els = Array.from(document.querySelectorAll('button,a,[role=button]'));
+  const hit = els.find(e => {
+    const t = (e.innerText || '').trim().toLowerCase();
+    return t.includes('复制登录链接') || t.includes('copy login link') ||
+           t.includes('copy link');
+  });
+  if (!hit) return {clicked: false};
+  hit.click();
+  return {clicked: true};
+})()"""
+
+
+def auto_click_client_login(port: int = 9222, timeout: float = 25) -> bool:
+    """无人值守：客户端自身 CDP 点「立即登录」→「复制登录链接」入剪贴板。
+
+    2026-11-19 实测：客户端 cdp 模式带 --remote-debugging-port，
+    登录浮层按钮可 DOM click；点后进入「等待浏览器确认」态并出现
+    「复制登录链接」。失败返回 False，回退人工点一次提示。
+    """
+    import urllib.request
+
+    from app.register.cdp_page import CDPPage
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/list", timeout=3) as r:
+            ts = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return False
+    pages = [t for t in ts if t.get("type") == "page"
+             and t.get("webSocketDebuggerUrl")]
+    # 登录浮层优先：workbench 页启动期求值可能挂起，放后面
+    pages.sort(key=lambda t: 0 if ("onboarding" in (t.get("url") or "")
+                                   or "entry=login" in (t.get("url") or "")) else 1)
+    deadline = time.time() + timeout
+    for t in pages:
+        p = None
+        try:
+            # 短超时：客户端启动期个别页求值会挂起，长超时一次耗光
+            # 重试预算（2026-11-19 实测 60s 挂起导致自动登录失败）
+            p = CDPPage(f"http://127.0.0.1:{port}",
+                        ws_url=t["webSocketDebuggerUrl"], timeout=8)
+            r = p.eval(JS_CLIENT_CLICK_LOGIN) or {}
+            if not r.get("clicked"):
+                continue
+            log.info("[ui-login] 客户端 CDP 点了「%s」", r.get("text"))
+            while time.time() < deadline:
+                c = p.eval(JS_CLIENT_COPY_LINK) or {}
+                if c.get("clicked"):
+                    log.info("[ui-login] 客户端 CDP 点了「复制登录链接」")
+                    time.sleep(0.6)
+                    return True
+                time.sleep(1.0)
+            return True   # 登录已点，链接也可能会进浏览器历史
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[ui-login] 客户端自动登录异常：%s", exc)
+        finally:
+            if p is not None:
+                try:
+                    p.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    return False
+
+
+# ------------------------------------------------------------ 客户端弹层/权益
+JS_ONBOARD_SKIP = """(() => {
+  const els = Array.from(document.querySelectorAll('button,a,[role=button],div,span'));
+  const hit = els.find(e => ['跳过', 'skip', '开始使用', 'get started']
+    .includes((e.innerText || '').trim().toLowerCase())
+    && e.getBoundingClientRect().width > 0);
+  if (!hit) return false;
+  hit.click();
+  return true;
+})()"""
+
+JS_DISMISS = """(() => {
+  const want = ['忽略', '跳过', '开始使用', '知道了', '稍后', '以后再说', '关闭'];
+  const els = Array.from(document.querySelectorAll('button,a,[role=button],div,span'))
+    .filter(e => want.includes((e.innerText || '').trim())
+      && e.getBoundingClientRect().width > 0);
+  if (!els.length) return null;
+  els.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+  const r = els[0].getBoundingClientRect();
+  return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+})()"""
+
+JS_CLAIM_BTN = """(() => {
+  const want = ['领取', '立即领取', '领取权益', '领取新手礼', 'claim',
+                'claim now', 'claim benefits', '激活', '开始试用',
+                'start trial', '立即体验'];
+  const els = Array.from(document.querySelectorAll('button,a,[role=button]'))
+    .filter(e => {
+      const t = (e.innerText || '').trim().toLowerCase();
+      return want.some(w => t === w || t.startsWith(w))
+        && e.getBoundingClientRect().width > 0;
+    });
+  if (!els.length) return null;
+  const r = els[0].getBoundingClientRect();
+  return {text: (els[0].innerText || '').trim(),
+          x: r.x + r.width / 2, y: r.y + r.height / 2};
+})()"""
+
+
+def _client_pages(port: int = 9222) -> list:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/list", timeout=3) as r:
+            ts = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return []
+    return [t for t in ts if t.get("type") == "page"
+            and t.get("webSocketDebuggerUrl")]
+
+
+def dismiss_client_overlays(port: int = 9222, rounds: int = 8) -> int:
+    """清客户端新手引导/促销弹层（onboarding 多步跳过 + workbench 忽略）。
+
+    引导浮层会挡住工作区一切点击（实测权益中心点不动的根因之一）。
+    返回点击次数。"""
+    from app.register.cdp_page import CDPPage
+    n = 0
+    for _ in range(rounds):
+        acted = False
+        for t in _client_pages(port):
+            url = t.get("url") or ""
+            try:
+                p = CDPPage(f"http://127.0.0.1:{port}",
+                            ws_url=t["webSocketDebuggerUrl"], timeout=8)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if "onboarding" in url:
+                    if p.eval(JS_ONBOARD_SKIP):
+                        n += 1
+                        acted = True
+                elif "workbench" in url:
+                    d = p.eval(JS_DISMISS)
+                    if d:
+                        p.mouse("mouseMoved", float(d["x"]), float(d["y"]))
+                        time.sleep(0.2)
+                        p.mouse("mousePressed", float(d["x"]), float(d["y"]),
+                                buttons=1)
+                        time.sleep(0.1)
+                        p.mouse("mouseReleased", float(d["x"]), float(d["y"]),
+                                buttons=0)
+                        n += 1
+                        acted = True
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    p.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not acted:
+            break
+        time.sleep(2)
+    if n:
+        log.info("[ui-login] 客户端弹层清理 %d 次", n)
+    return n
+
+
+def claim_client_campaign(port: int = 9222, rounds: int = 4) -> bool:
+    """领取客户端「恭喜成为 Qoder 新用户」贺屏/权益中心里的领取按钮。
+
+    扫所有客户端 page target（贺屏可能是独立 webview），多轮捕获
+    跳过引导后才弹出的贺屏；best-effort，不阻断领取主流程。
+    """
+    from app.register.cdp_page import CDPPage
+    claimed = False
+    for _ in range(rounds):
+        hit_any = False
+        for t in _client_pages(port):
+            url = t.get("url") or ""
+            try:
+                p = CDPPage(f"http://127.0.0.1:{port}",
+                            ws_url=t["webSocketDebuggerUrl"], timeout=8)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if "workbench" in url:
+                    # 开用量面板（Credits 入口），campaign 内容嵌在其中
+                    p.eval("""(() => {
+                      const els = Array.from(document.querySelectorAll('button,a,[role=button],div,span'));
+                      const hit = els.find(e => (e.innerText || '').trim() === 'Credits'
+                        && e.getBoundingClientRect().width > 0);
+                      if (hit) hit.click();
+                    })()""")
+                    time.sleep(2)
+                btn = p.eval(JS_CLAIM_BTN)
+                if btn:
+                    log.info("[ui-login] 客户端权益按钮: %s @%s",
+                             btn.get("text"), url[:50])
+                    p.mouse("mouseMoved", float(btn["x"]), float(btn["y"]))
+                    time.sleep(0.2)
+                    p.mouse("mousePressed", float(btn["x"]), float(btn["y"]),
+                            buttons=1)
+                    time.sleep(0.1)
+                    p.mouse("mouseReleased", float(btn["x"]), float(btn["y"]),
+                            buttons=0)
+                    time.sleep(3)
+                    claimed = True
+                    hit_any = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[ui-login] 权益领取尝试异常：%s", exc)
+            finally:
+                try:
+                    p.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not hit_any:
+            break
+        time.sleep(2)
+    return claimed
+
+
 # ------------------------------------------------------------ 回调工厂
 def make_ui_login(
     cfg,
@@ -545,7 +821,18 @@ def make_ui_login(
     state: dict = {}
 
     def _ui(_claimer) -> bool:
-        print("请在弹出的 Qoder 客户端窗口点一次「登录」（或点「复制登录链接」）…")
+        # 客户端重置后重启需要几秒 CDP 才监听：轮询重试自动点击，
+        # 旧版只试一次→客户端还没起来就放弃→空等人工点击超时
+        clicked = False
+        dl = time.time() + 45
+        while time.time() < dl and not clicked:
+            clicked = auto_click_client_login(timeout=6)
+            if not clicked:
+                time.sleep(2)
+        if clicked:
+            log.info("客户端登录已自动点击，等链接进剪贴板/历史")
+        else:
+            print("请在弹出的 Qoder 客户端窗口点一次「登录」（或点「复制登录链接」）…")
         print(f"我在等登录链接，最多 {link_timeout}s（剪贴板 / 浏览器历史都会看）")
         started = time.time()
         link, src = wait_link(timeout=link_timeout, since=started)

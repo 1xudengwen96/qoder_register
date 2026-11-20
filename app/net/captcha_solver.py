@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -114,8 +115,9 @@ class TwoCaptcha:
             raise CaptchaError(f"2Captcha 提交失败：{data.get('request')}")
         req_id = data["request"]
         deadline = time.time() + self.timeout
+        # 首查 3s、后续每 3s：人工求解常见 8-15s，5s 粒度平均多等 2.5s
         while time.time() < deadline:
-            time.sleep(5)
+            time.sleep(3)
             rr = requests.get(self.RES, params={
                 "key": self.api_key, "action": "get", "id": req_id, "json": 1,
             }, timeout=30)
@@ -146,23 +148,27 @@ class CaptchaSolver:
         self.solved = 0
         self.failed = 0
         self.history: list[CaptchaResult] = []
+        self._lock = threading.Lock()   # 并发 worker 共享调度器，计费/计数必须互斥
 
     def solve(self, task: CaptchaTask) -> CaptchaResult:
         p = self.provider
         if p is None or not p.supports(task.kind):
-            self.failed += 1
+            with self._lock:
+                self.failed += 1
             raise CaptchaError(
                 f"2Captcha 未配置或不支持 {task.kind}"
                 "（自研识别已移除，配置 captcha.providers.2captcha.api_key）")
         try:
-            res = p.solve(task)
+            res = p.solve(task)          # 网络求解不持锁，不阻塞其他 worker
+        except CaptchaError:
+            with self._lock:
+                self.failed += 1
+            raise
+        with self._lock:
             self.spent += res.cost
             self.solved += 1
             self.history.append(res)
-            return res
-        except CaptchaError:
-            self.failed += 1
-            raise
+        return res
 
     def cost_summary(self) -> str:
         return (f"打码成功 {self.solved} 次，失败 {self.failed} 次，"

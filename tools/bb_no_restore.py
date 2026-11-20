@@ -13,9 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,59 +22,11 @@ sys.path.insert(0, str(ROOT))
 
 from app import secrets  # noqa: E402
 from app.register import cdp_raw  # noqa: E402
+from app.register.bb_cdp import (  # noqa: E402
+    find_profile_dir,
+    patch_preferences,
+)
 from app.register.bitbrowser import BitBrowserClient  # noqa: E402
-
-
-def find_profile_dir(env_id: str) -> Path | None:
-    """profile 在客户端的 ``browser_cache_dir`` 下，目录名就是环境 id。
-
-    默认 ``D:\\bitbrowser-cache``（可从客户端全局配置 ``browser_cache_dir`` 读到）。
-    """
-    candidates = [Path("D:/bitbrowser-cache") / env_id,
-                  Path.home() / "AppData/Local/BitBrowser" / env_id,
-                  Path.home() / "AppData/Roaming/BitBrowser" / env_id]
-    for c in candidates:
-        if (c / "Default" / "Preferences").exists() or c.is_dir():
-            return c
-    # 兜底：从运行中的 chrome 命令行挖
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-             "Select-Object -ExpandProperty CommandLine"],
-            capture_output=True, text=True, timeout=30,
-            encoding="utf-8", errors="replace").stdout
-    except Exception:
-        return None
-    for line in out.splitlines():
-        if "--user-data-dir=" not in line:
-            continue
-        m = re.search(r'--user-data-dir="?([^" ]+)"?', line)
-        if m and env_id in m.group(1):
-            return Path(m.group(1))
-    return None
-
-
-def patch_preferences(profile: Path) -> str:
-    prefs = profile / "Default" / "Preferences"
-    if not prefs.exists():
-        prefs = profile / "Preferences"
-    if not prefs.exists():
-        return f"没找到 Preferences: {prefs}"
-    try:
-        data = json.loads(prefs.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return f"Preferences 解析失败: {exc}"
-    session = data.setdefault("session", {})
-    before = dict(session)
-    session["restore_on_startup"] = 4      # 4 = Open the New Tab page
-    session["startup_urls"] = []
-    prof = data.setdefault("profile", {})
-    # 避免「恢复崩溃标签」气泡
-    prof.pop("exit_type", None)
-    prof["exited_cleanly"] = True
-    prefs.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    return f"{prefs}\n    原 session={before}\n    新 session={session}"
 
 
 def main() -> int:

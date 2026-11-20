@@ -7,8 +7,10 @@ import enum
 import json
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -147,3 +149,18 @@ class ProxyEntry(Base):
     fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     __table_args__ = (UniqueConstraint("endpoint", name="uq_proxy_endpoint"),)
+
+
+class MailCodeEvent(Base):
+    """常驻收信进程命中的验证码事件（注册流程只等事件，不再临时连邮箱）。"""
+    __tablename__ = "mail_code_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    address: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    uid: Mapped[str] = mapped_column(String(64), nullable=False)
+    folder: Mapped[str] = mapped_column(String(32), default="INBOX", nullable=False)
+    code: Mapped[str] = mapped_column(String(16), nullable=False)
+    ts: Mapped[float] = mapped_column(Float, nullable=False)
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (UniqueConstraint("address", "uid", name="uq_mail_code_addr_uid"),)

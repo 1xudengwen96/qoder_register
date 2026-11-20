@@ -103,8 +103,13 @@ class Registrar:
             return
         await locator.click()
         for ch in text:
-            await locator.type(ch, delay=random.randint(40, 140))
-        await locator.page.wait_for_timeout(random.randint(200, 600))
+            d = random.randint(90, 260)
+            if not ch.isalnum():
+                d += random.randint(50, 180)
+            await locator.type(ch, delay=d)
+            if random.random() < 0.07:
+                await locator.page.wait_for_timeout(random.randint(350, 1000))
+        await locator.page.wait_for_timeout(random.randint(400, 1000))
 
     # ---- 验证码 -----------------------------------------------------------
     async def _handle_captcha(self, page: Any, proxy: Proxy | None) -> bool:

@@ -226,6 +226,18 @@ class CDP:
     # ---------------------------------------------------------- 调用
     def call(self, method: str, params: dict | None = None,
              timeout: float = 60.0) -> dict:
+        # 可选取证追踪：QODER_CDP_TRACE=文件路径 时记录所有 JS 求值
+        # （eval 重放实验用，正常流程不设此环境变量零开销）
+        trace = os.environ.get("QODER_CDP_TRACE", "")
+        if trace and method == "Runtime.evaluate":
+            try:
+                with open(trace, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "ts": time.time(),
+                        "expr": str((params or {}).get("expression", ""))[:2000],
+                    }, ensure_ascii=False) + "\n")
+            except Exception:  # noqa: BLE001
+                pass
         mid = next(self._ids)
         self.ws.send_text(json.dumps({"id": mid, "method": method,
                                       "params": params or {}}))
@@ -244,19 +256,30 @@ class CDP:
 
     # ---------------------------------------------------------- 常用
     def enable(self) -> None:
-        for dom in ("Page", "Runtime", "Network"):
-            try:
-                self.call(f"{dom}.enable")
-            except CDPError:
-                pass
+        """默认不开任何 domain（2026-11-19 反检测修正）。
+
+        Runtime.enable 是可被页面探测的 CDP 附着特征：开启后
+        console.debug 序列化会触发对象 getter，风控脚本据此判定
+        有调试器附着（Baxia 九宫格疑似触发点之一）。而 evaluate /
+        Page.navigate / 截图都不需要 enable 就能工作；Network 事件
+        由流程在需要时自行 Network.enable。旧版无脑开
+        Page/Runtime/Network 三个 domain 已移除。
+        """
+        return
 
     def evaluate(self, expression: str, await_promise: bool = True,
-                 timeout: float = 60.0) -> Any:
+                 timeout: float = 60.0, user_gesture: bool = False) -> Any:
         res = self.call("Runtime.evaluate", {
             "expression": expression,
             "awaitPromise": await_promise,
             "returnByValue": True,
-            "userGesture": True,
+            # 默认不给用户激活（2026-11-19 被动附着实验定位）：
+            # userGesture=true 会让页面凭空获得 user activation，
+            # 而没有任何真实输入事件——风控可查「有激活无输入」
+            # 矛盾判定自动化。手动+被动CDP不弹二次验证，程序主动
+            # 操作弹，此项是主动操作里最可观测的异常。真需要
+            # 激活的调用（如剪贴板 API）显式传 user_gesture=True。
+            "userGesture": user_gesture,
         }, timeout=timeout)
         if res.get("exceptionDetails"):
             det = res["exceptionDetails"]

@@ -16,6 +16,8 @@ CDP 的 ``Input.dispatchMouseEvent`` 用 **CSS 像素、相对视口左上角**�
 from __future__ import annotations
 
 import json
+import logging
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -71,6 +73,9 @@ class CDPPage:
         self.cdp = cdp_raw.CDP(endpoint, ws_url=ws_url, timeout=timeout)
         self.cdp.enable()
         self.default_timeout = timeout
+        # OS 级真实输入器（可选）：挂上后填表/点击走 SendInput，
+        # 事件流与真人硬件一致（coalesced 样本）；未挂/失败退回 CDP
+        self.os_input = None
 
     # ---------------------------------------------------------- 基础
     def goto(self, url: str, wait_ms: int = 0) -> str:
@@ -174,17 +179,63 @@ class CDPPage:
         self.cdp.call("Input.dispatchMouseEvent", params)
 
     def move(self, x: float, y: float, buttons: int = 0) -> None:
+        # 无按键的纯移动（空闲微动/轨迹）走 OS 队列，避免 coal=1 破绽；
+        # 带按键的拖动（滑块）仍走 CDP，保持已验证的求解链路不动
+        if buttons == 0 and self.os_input is not None and self.os_input.ready:
+            try:
+                self.os_input.move(x, y)
+                return
+            except Exception:  # noqa: BLE001
+                pass
         self.mouse("mouseMoved", x, y, buttons)
 
     def click_xy(self, x: float, y: float, human: bool = True) -> None:
-        if human:
-            self.move(x - random.uniform(8, 25), y + random.uniform(-12, 12))
-            time.sleep(random.uniform(0.04, 0.08))
-        self.move(x, y)
-        time.sleep(random.uniform(0.03, 0.07))
-        self.mouse("mousePressed", x, y, buttons=1)
-        time.sleep(random.uniform(0.03, 0.09))
-        self.mouse("mouseReleased", x, y, buttons=0)
+        """点击。``human=True`` 走完整鼠标轨迹（与 drag 同级拟真）。
+
+        背景（2026-11-17 夜，Baxia 九宫格 23 连败实测）：只有 2 个
+        move 点的"瞬移式"点击会被 Baxia 服务端异步判废——格子选中态
+        在 ~1s 内闪现即被撤销清空，随后无论怎么补点都只剩空选；
+        而带 30 步缓动轨迹的滑块拖动一直能过。所以点击也必须带轨迹。
+        """
+        if human and self.os_input is not None and self.os_input.ready:
+            try:
+                self.os_input.click_xy(x, y)
+                return
+            except Exception as exc:  # noqa: BLE001
+                # 退回必须可见：静默退 CDP 会让「鼠标没动就点了」
+                # 的破绽惄无声息地混进流程（2026-11-19 用户观察反馈）
+                logging.getLogger("qoder_register").warning(
+                    "OS 点击失败退 CDP（无真实鼠标轨迹）：%s", exc)
+        if not human:
+            self.move(x, y)
+            time.sleep(random.uniform(0.03, 0.07))
+            self.mouse("mousePressed", x, y, buttons=1)
+            time.sleep(random.uniform(0.03, 0.09))
+            self.mouse("mouseReleased", x, y, buttons=0)
+            return
+        # 目标本身带一点抖动：真人不会点在几何中心上
+        tx = x + random.uniform(-4.5, 4.5)
+        ty = y + random.uniform(-4.5, 4.5)
+        # 轨迹起点：距目标随机方向的远处一点
+        ang = random.uniform(0, 2 * math.pi)
+        dist = random.uniform(60, 160)
+        sx = tx - dist * math.cos(ang)
+        sy = ty - dist * math.sin(ang)
+        steps = random.randint(24, 40)
+        ease = random.uniform(1.8, 2.8)     # 每次轨迹缓动不同，避免模式指纹
+        self.move(sx, sy)
+        time.sleep(random.uniform(0.05, 0.15))
+        for i in range(1, steps + 1):
+            t = i / steps
+            eased = 1 - (1 - t) ** ease                  # ease-out
+            px = sx + (tx - sx) * eased + random.uniform(-1.2, 1.2)
+            py = sy + (ty - sy) * eased + random.uniform(-1.2, 1.2)
+            self.move(px, py)
+            time.sleep(random.uniform(0.008, 0.022))
+        time.sleep(random.uniform(0.06, 0.15))          # hover 停顿
+        self.mouse("mousePressed", tx, ty, buttons=1)
+        time.sleep(random.uniform(0.05, 0.11))
+        self.mouse("mouseReleased", tx, ty, buttons=0)
         time.sleep(random.uniform(0.05, 0.12))
 
     def click(self, selector: str, human: bool = True,
@@ -217,15 +268,35 @@ class CDPPage:
         return True
 
     def check(self, selector: str) -> bool:
-        """勾选 checkbox（React 受控组件走原生 click 才触发 onChange）。"""
-        js = f"""(() => {{
+        """勾选 checkbox：先真人轨迹点击（完整鼠标事件链），
+        JS click 只做兑底——裸 e.click() 没有前置 mousemove/down/up，
+        行为遥测里是明确的机器特征。"""
+        if not self.exists(selector):
+            return False
+        already = self.eval(
+            f"(() => {{ const e = document.querySelector({json.dumps(selector)});"
+            f" return e ? !!e.checked : false; }})()")
+        if already:
+            return True
+        self.click(selector, human=True)
+        # React 受控组件状态更新有延迟：多等几轮再读，避免误判
+        # 「没勾上」而补 JS click——那会双切换反而取消勾选
+        for _ in range(3):
+            time.sleep(random.uniform(0.25, 0.5))
+            checked = self.eval(
+                f"(() => {{ const e = document.querySelector({json.dumps(selector)});"
+                f" return e ? !!e.checked : false; }})()")
+            if checked:
+                return True
+        # 兑底：确实没勾上（被遮挡/坐标偏）才用 JS click
+        out = self.eval(f"""(() => {{
           const e = document.querySelector({json.dumps(selector)});
           if (!e) return 'missing';
           if (e.checked) return 'already';
           e.click();
           return 'clicked';
-        }})()"""
-        out = self.eval(js)
+        }})()""")
+        time.sleep(random.uniform(0.25, 0.5))
         checked = self.eval(
             f"(() => {{ const e = document.querySelector({json.dumps(selector)});"
             f" return e ? !!e.checked : false; }})()")
@@ -263,17 +334,35 @@ class CDPPage:
         return bool(out)
 
     def clear(self, selector: str) -> None:
-        """清空输入框，走原生 setter 让 React 感知。"""
-        self.eval(f"""(() => {{
-          const e = document.querySelector({json.dumps(selector)});
-          if (!e) return false;
-          const setter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype, 'value').set;
-          setter.call(e, '');
-          e.dispatchEvent(new Event('input', {{bubbles: true}}));
-          e.dispatchEvent(new Event('change', {{bubbles: true}}));
-          return true;
-        }})()""")
+        """清空输入框：真人式 Ctrl+A → Delete（真实按键事件链）。
+
+        旧版走原生 setter + 合成 input/change：没有按键事件前置，
+        且 React 受控组件对 setter 改值不触发 onChange，是双重破绽。
+        仅在框非空时才需要清；OS 输入不可用时退回 CDP 真键。"""
+        if not self.value(selector):
+            return
+        if self.os_input is not None and self.os_input.ready:
+            try:
+                self.os_input.clear_keys()
+                if not self.value(selector):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        # CDP 真键兑底：Ctrl+A → Delete
+        self.cdp.call("Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": "Control", "code": "ControlLeft",
+            "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17,
+            "modifiers": 2})
+        for t in ("keyDown", "keyUp"):
+            self.cdp.call("Input.dispatchKeyEvent", {
+                "type": t, "key": "a", "code": "KeyA",
+                "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65,
+                "modifiers": 2})
+        self.cdp.call("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": "Control", "code": "ControlLeft",
+            "windowsVirtualKeyCode": 17, "nativeVirtualKeyCode": 17})
+        time.sleep(random.uniform(0.08, 0.2))
+        self.key("Backspace")
 
     def key(self, name: str) -> None:
         code, vk = SPECIAL_KEYS.get(name, (name, 0))
@@ -284,35 +373,72 @@ class CDPPage:
             "type": "keyUp", "key": name, "code": code,
             "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
 
-    def type_text(self, text: str, delay: tuple[float, float] = (0.045, 0.14)) -> None:
-        """逐字符发真实键盘事件（React 只认原生事件流）。"""
-        for ch in text:
+    def type_text(self, text: str, delay: tuple[float, float] = (0.09, 0.26)) -> None:
+        """逐字符发真实键盘事件（React 只认原生事件流）。
+
+        挂了 OS 输入器时走 SendInput（硬件级事件，coalesced 样本与
+        真人一致）；否则用 CDP 注入。拟人节奏（2026-11-19 用户要求：
+        所有填表放慢模拟人手）：
+        - 键按下后停留 50~130ms 再抬起（真人有持键时长，不是瞬发）
+        - 字符间隔放慢到 90~260ms 随机
+        - 符号（@ . _ - 等）后略迟疑——换键位需要时间
+        - 偶尔来一段「想一下」的长停顿；均匀快打是机器特征
+        """
+        if self.os_input is not None and self.os_input.ready:
+            try:
+                self.os_input.type_text(text, delay=delay)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger("qoder_register").warning(
+                    "OS 键盘失败退 CDP 注入：%s", exc)
+        for i, ch in enumerate(text):
             code, vk = _key_meta(ch)
             self.cdp.call("Input.dispatchKeyEvent", {
                 "type": "keyDown", "text": ch, "unmodifiedText": ch,
                 "key": ch, "code": code,
                 "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+            time.sleep(random.uniform(0.05, 0.13))      # 持键时长
             self.cdp.call("Input.dispatchKeyEvent", {
                 "type": "keyUp", "key": ch, "code": code,
                 "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
-            time.sleep(random.uniform(*delay))
+            gap = random.uniform(*delay)
+            if not ch.isalnum():
+                gap += random.uniform(0.05, 0.18)       # 符号换手迟疑
+            if i and random.random() < 0.07:
+                gap += random.uniform(0.35, 1.0)        # 偶尔停下想一下
+            time.sleep(gap)
 
     def fill(self, selector: str, text: str,
-             delay: tuple[float, float] = (0.045, 0.14),
+             delay: tuple[float, float] = (0.09, 0.26),
              human: bool = True) -> bool:
-        """聚焦 → 清空 → 逐字符输入。"""
+        """点框 → 清空 → 逐字符输入。
+
+        human=True 时先用带轨迹的真人鼠标点击进框（不是 JS focus
+        瞬移焦点），点完停一下「看一眼」再下手打字。
+        """
         if not self.sel_ready(selector, timeout=15):
             return False
-        self.focus(selector)
-        time.sleep(random.uniform(0.08, 0.2))
-        self.clear(selector)
-        time.sleep(random.uniform(0.05, 0.12))
-        if human:
-            self.type_text(text, delay=delay)
-        else:
-            self.cdp.call("Input.insertText", {"text": text})
-        time.sleep(random.uniform(0.15, 0.35))
-        return self.value(selector) == text
+        # 新建窗口后的首次合成输入偶发被 Windows 前台机制吞掉
+        # （焦点未建立→值落空）：值不符时重试一次点击+输入
+        for attempt in range(2):
+            if human:
+                self.click(selector, human=True)
+                time.sleep(random.uniform(0.1, 0.3))
+            else:
+                self.focus(selector)
+                time.sleep(random.uniform(0.08, 0.2))
+            self.clear(selector)
+            time.sleep(random.uniform(0.08, 0.18))
+            if human:
+                self.type_text(text, delay=delay)
+            else:
+                self.cdp.call("Input.insertText", {"text": text})
+            time.sleep(random.uniform(0.15, 0.35))
+            if self.value(selector) == text:
+                return True
+            logging.getLogger("qoder_register").warning(
+                "fill %s 第%d次值不符，重试", selector, attempt + 1)
+        return False
 
     # ---------------------------------------------------------- 收尾
     def close_tab(self) -> None:
@@ -334,12 +460,33 @@ class CDPPage:
 
 
 # ============================================================ 新建标签页
-def new_page(endpoint: str, url: str = "about:blank", timeout: float = 30.0) -> CDPPage:
-    """在已启动的浏览器里新开一个标签页（不动比特浏览器自带的工作台页）。"""
+def new_page(endpoint: str, url: str = "about:blank", timeout: float = 30.0,
+             reuse_blank: bool = False) -> CDPPage:
+    """在已启动的浏览器里开一个可控标签页。
+
+    ``reuse_blank=True``：优先附着到已有的空白页（启动自带的那个），
+    全程单标签——多标签会被风控看出「同一环境反复开一堆页」。
+    没有空白页才新建。
+    """
     import urllib.parse
     import urllib.request
 
     base = cdp_raw.normalize_base(endpoint)
+    if reuse_blank:
+        try:
+            with urllib.request.urlopen(base + "/json/list",
+                                        timeout=timeout) as resp:
+                targets = json.loads(resp.read().decode("utf-8", "replace"))
+            for t in targets:
+                if t.get("type") != "page":
+                    continue
+                u = (t.get("url") or "").strip()
+                if u in ("", "about:blank", "chrome://newtab/"):
+                    ws = t.get("webSocketDebuggerUrl")
+                    if ws:
+                        return CDPPage(endpoint, ws_url=ws, timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
     target = base + "/json/new?" + urllib.parse.urlencode({"url": url})
     req = urllib.request.Request(target, method="PUT")
     info = None

@@ -83,7 +83,12 @@ class CDPRegistrar:
         imap_proxy: str | None = None,
         headless: bool = False,
         keep_open: bool = False,
+        env_pool=None,
         logger: logging.Logger | None = None,
+        manual_captcha: bool = False,
+        manual_timeout: int = 600,
+        manual_otp: bool = False,
+        manual_form: bool = False,
     ) -> None:
         if client is None:
             from app.register.bitbrowser import BitBrowserClient
@@ -109,7 +114,15 @@ class CDPRegistrar:
         self.imap_proxy = imap_proxy
         self.headless = headless
         self.keep_open = keep_open
+        # 窗口池（bb_pool.EnvPool）：非 None 时不再每号新建环境，
+        # 而是随机挑空闲池窗口重配指纹+代理+清残留后复用。
+        self.env_pool = env_pool
         self.log = logger or log
+        # 人工滑块：True 时③步暂停等用户手滑，通过后自动接管
+        self.manual_captcha = manual_captcha
+        self.manual_timeout = manual_timeout
+        self.manual_otp = manual_otp
+        self.manual_form = manual_form
 
     # ------------------------------------------------------------ 打码
     def _captcha_key(self) -> str:
@@ -125,17 +138,28 @@ class CDPRegistrar:
 
     def _paid_client(self):
         key = self._captcha_key()
-        if not key:
-            self.log.warning("没配 2Captcha key，滑块只走本地识别")
-            return None
-        from app.net.twocaptcha_dragdrop import TwoCaptchaDragDrop
+        paid = None
+        if key:
+            from app.net.twocaptcha_dragdrop import TwoCaptchaDragDrop
 
-        paid = TwoCaptchaDragDrop(key, proxy=self.imap_proxy)
-        try:
-            self.log.info("2Captcha 余额 $%.4f", paid.balance())
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("2Captcha 余额查询失败（不影响识别）：%s", exc)
-        return paid
+            paid = TwoCaptchaDragDrop(key, proxy=self.imap_proxy)
+            try:
+                self.log.info("2Captcha 余额 $%.4f", paid.balance())
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("2Captcha 余额查询失败（不影响识别）：%s", exc)
+        else:
+            self.log.warning("没配 2Captcha key，滑块只走本地识别")
+        # 超级鹰试验通道：启用时优先，API 异常自动回退 2Captcha
+        from app.net.chaojiying import build_slider_paid
+
+        wrapped = build_slider_paid(paid)
+        if wrapped is not paid:
+            try:
+                self.log.info("超级鹰优先（题分 %.0f），2Captcha 兜底",
+                              wrapped.primary.balance())
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("超级鹰题分查询失败（不影响识别）：%s", exc)
+        return wrapped
 
     # ------------------------------------------------------------ 健康
     def health(self) -> tuple[bool, str]:
@@ -171,18 +195,25 @@ class CDPRegistrar:
         res = CDPRegisterResult(ok=False)
         launch = None
         page = None
+        used_pool = False
         try:
-            launch = bb_cdp.open_for_register(
-                self.client,
-                proxy=proxy,
-                region=region,
-                account_tag=account_tag,
-                env_name=env_name,
-                env_id=self.env_id,
-                group_id=self.group_id,
-                reuse_env=self.reuse_env,
-                headless=self.headless,
-            )
+            if self.env_pool is not None and not self.env_id:
+                launch = self.env_pool.acquire(
+                    account_tag or email, region=region,
+                    proxy=proxy, headless=self.headless)
+                used_pool = True
+            else:
+                launch = bb_cdp.open_for_register(
+                    self.client,
+                    proxy=proxy,
+                    region=region,
+                    account_tag=account_tag,
+                    env_name=env_name,
+                    env_id=self.env_id,
+                    group_id=self.group_id,
+                    reuse_env=self.reuse_env,
+                    headless=self.headless,
+                )
             res.env_id = launch.env_id
             res.endpoint = launch.endpoint
             res.proxy = launch.proxy_label
@@ -190,7 +221,22 @@ class CDPRegistrar:
                           launch.env_name, launch.endpoint, launch.proxy_label,
                           "新建" if launch.created else "复用")
 
-            page = new_page(launch.endpoint, "about:blank")
+            page = new_page(launch.endpoint, "about:blank", reuse_blank=True)
+            # OS 级真实输入：CDP 注入的 pointermove 永远单 coalesced 样本，
+            # 会被 Baxia 行为遥测识破（2026-11-19 取证实锤）；挂上后
+            # 填表/点击走 SendInput，失败自动退回 CDP 不阻断流程
+            try:
+                from app.register.os_input import OSInput
+
+                page.os_input = OSInput(page, launch.pid)
+                if page.os_input.ready:
+                    self.log.info("填表输入=OS 级 SendInput（hwnd=%s）",
+                                  page.os_input.hwnd)
+                else:
+                    self.log.warning("OS 输入未就绪（首次动作时重试校准，"
+                                     "失败则退 CDP）pid=%s", launch.pid)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("OS 输入器初始化异常（用 CDP 注入）：%s", exc)
             paid = self._paid_client()
             flow = QoderSignupCDP(
                 page,
@@ -201,6 +247,10 @@ class CDPRegistrar:
                 proxy=(proxy.raw if proxy else None),
                 paid_client=paid,
                 prefer_paid=paid is not None,
+                manual_captcha=self.manual_captcha,
+                manual_timeout=self.manual_timeout,
+                manual_otp=self.manual_otp,
+                manual_form=self.manual_form,
             )
             provider = code_source if callable(code_source) else None
             rep = flow.run(email, password, code_provider=provider,
@@ -232,10 +282,34 @@ class CDPRegistrar:
             res.elapsed = time.time() - t0
             try:
                 if page is not None:
+                    if not res.ok:
+                        # 失败：导回空白页再断连，不给下次启动留旧标签
+                        try:
+                            page.goto("about:blank", wait_ms=200)
+                        except Exception:  # noqa: BLE001
+                            pass
                     page.close()
             except Exception:  # noqa: BLE001
                 pass
-            if launch and not self.keep_open:
+            if launch and used_pool:
+                if res.ok:
+                    # 成功：窗口留开并锁定，领取段还要复用注册 Cookie
+                    # 做免密授权；领取完成由 orchestrator 调 finish_claim。
+                    self.env_pool.mark_claim_hold(launch.env_id)
+                    if account_tag:
+                        self.env_pool.remember_account(
+                            account_tag, launch.env_id, launch.env_name)
+                    self.log.info("窗口 %s 留开锁定，等待领取段复用注册 Cookie",
+                                  launch.env_name)
+                elif self.env_pool.is_temp(launch.env_id):
+                    self.env_pool.delete_temp(launch.env_id)
+                    self.log.info("溢出临时窗口 %s 已删除", launch.env_name)
+                else:
+                    bb_cdp.close_env(self.client, launch.env_id)
+                    self.env_pool.release(launch.env_id)
+                    self.log.info("窗口 %s 已关闭回池（下次用前重配+清残留）",
+                                  launch.env_name)
+            elif launch and not self.keep_open:
                 bb_cdp.close_env(self.client, launch.env_id)
                 self.log.info("已关闭环境 %s", launch.env_name)
 

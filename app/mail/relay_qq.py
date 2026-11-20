@@ -26,6 +26,7 @@ from __future__ import annotations
 import email
 import imaplib
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from email.header import decode_header, make_header
@@ -375,21 +376,23 @@ class ICloudRelayQQProvider:
         self.timeout = timeout
         self.taken = {a.lower() for a in (taken_addresses or set())}
         self.cursor = 0
+        self._lock = threading.Lock()   # 并发 worker 共享本 provider，cursor/taken 必须互斥
 
     # ---------------------------------------------------------- 池
     def acquire(self, n: int = 1) -> list[MailIdentity]:
         out: list[MailIdentity] = []
-        while self.cursor < len(self.pool.addresses) and len(out) < n:
-            addr = self.pool.addresses[self.cursor]
-            self.cursor += 1
-            if addr.lower() in self.taken:
-                continue
-            self.taken.add(addr.lower())
-            out.append(MailIdentity(
-                address=addr, provider=self.name,
-                parent_account=self.imap_user, secret=None,
-                imap_host=self.imap_host,
-                meta={"relay": True, "aggregator": self.imap_user}))
+        with self._lock:
+            while self.cursor < len(self.pool.addresses) and len(out) < n:
+                addr = self.pool.addresses[self.cursor]
+                self.cursor += 1
+                if addr.lower() in self.taken:
+                    continue
+                self.taken.add(addr.lower())
+                out.append(MailIdentity(
+                    address=addr, provider=self.name,
+                    parent_account=self.imap_user, secret=None,
+                    imap_host=self.imap_host,
+                    meta={"relay": True, "aggregator": self.imap_user}))
         return out
 
     def identities(self, limit: int = 0) -> list[str]:

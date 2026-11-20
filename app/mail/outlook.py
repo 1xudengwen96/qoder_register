@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import string
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -68,6 +69,7 @@ class OutlookTagProvider:
         self.tag_prefix = tag_prefix
         self.max_tags = max_tags_per_account
         self.taken = {a.lower() for a in (taken_addresses or set())}
+        self._lock = threading.Lock()   # 并发 worker 共享本 provider，tags_used/taken 必须互斥
 
     # ---- pool -------------------------------------------------------------
     def _next_tag(self, main: OutlookMainAccount) -> str | None:
@@ -81,26 +83,27 @@ class OutlookTagProvider:
 
     def acquire(self, n: int = 1) -> list[MailIdentity]:
         out: list[MailIdentity] = []
-        for main in self.mains:
-            if main.retired:
-                continue
-            while len(out) < n and main.tags_used <= self.max_tags:
-                addr = self._next_tag(main)
-                if addr is None:
-                    break
-                self.taken.add(addr)
-                out.append(
-                    MailIdentity(
-                        address=addr,
-                        provider=self.name,
-                        parent_account=main.address,
-                        secret=main.password,
-                        imap_host=main.imap_host,
-                        meta={"tag": split_address(addr)[1]},
+        with self._lock:
+            for main in self.mains:
+                if main.retired:
+                    continue
+                while len(out) < n and main.tags_used <= self.max_tags:
+                    addr = self._next_tag(main)
+                    if addr is None:
+                        break
+                    self.taken.add(addr)
+                    out.append(
+                        MailIdentity(
+                            address=addr,
+                            provider=self.name,
+                            parent_account=main.address,
+                            secret=main.password,
+                            imap_host=main.imap_host,
+                            meta={"tag": split_address(addr)[1]},
+                        )
                     )
-                )
-            if len(out) >= n:
-                break
+                if len(out) >= n:
+                    break
         return out
 
     # ---- receive ----------------------------------------------------------

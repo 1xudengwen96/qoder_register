@@ -97,22 +97,23 @@ def read_credits(cfg, *, env_name: str = "", region: str = "us",
                  proxy=None, timeout: int = 40) -> Credits:
     """开窗口读账号页，解析计划与额度。登录态靠 profile 里的 cookie。"""
     from app.register import bb_cdp
-    from app.register.bitbrowser import BitBrowserClient
+    from app.register.bitbrowser import BitBrowserClient, resolve_base
     from app.register.cdp_page import new_page
 
-    api_base = "http://127.0.0.1:54345"
-    if cfg is not None:
-        from app.config import get
-        api_base = get(cfg, "browser.bitbrowser.api_base", api_base)
-    client = BitBrowserClient(api_base)
+    client = BitBrowserClient(resolve_base(cfg))
     launch = None
     page = None
     out = Credits()
     try:
-        launch = bb_cdp.open_for_register(
-            client, proxy=proxy, region=region,
-            env_name=env_name or "qoder_login", reuse_env=True,
-        )
+        name = env_name or "qoder_login"
+        # 已有同名环境（注册窗口/池窗口）：只启动不改配，
+        # 重写代理会换出口 IP 踢掉登录会话。
+        launch = bb_cdp.launch_existing(client, name)
+        if launch is None:
+            launch = bb_cdp.open_for_register(
+                client, proxy=proxy, region=region,
+                env_name=name, reuse_env=True,
+            )
         page = new_page(launch.endpoint, "about:blank")
         page.goto(USAGE_URL, wait_ms=5000)
         time.sleep(2)

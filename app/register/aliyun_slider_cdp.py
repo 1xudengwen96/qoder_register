@@ -168,9 +168,37 @@ JS_INJECT_IMAGES = r"""(args) => {
 JS_ARMED = """(() => {
   const s = document.querySelector('#aliyunCaptcha-sliding-slider');
   if (!s) return false;
-  const cls = String(s.className || '');
-  const pe = getComputedStyle(s).pointerEvents;
-  return !/initial/.test(cls) && pe !== 'none';
+  // initial 是组件空闲态标记（首次 mousedown 后才移除），不是锁死：
+  // 空闲态拖动同样生效（2026-11-18 日志反证 arm=False 首轮拖全生效）。
+  // 旧版把 initial 当锁死，导致每轮误触发 heal 篡改 DOM，只查 pointerEvents。
+  return getComputedStyle(s).pointerEvents !== 'none';
+})()"""
+
+JS_IMG_LOADED = """(() => {
+  const i = document.querySelector('#aliyunCaptcha-img');
+  const p = document.querySelector('#aliyunCaptcha-puzzle');
+  return {img: i ? i.naturalWidth : 0, pz: p ? p.naturalWidth : 0};
+})()"""
+
+JS_IMG_LOADED_OK = """(() => {
+  const i = document.querySelector('#aliyunCaptcha-img');
+  const p = document.querySelector('#aliyunCaptcha-puzzle');
+  return !!i && !!p && i.naturalWidth > 0 && p.naturalWidth > 0;
+})()"""
+
+JS_RELOAD_IMAGES = r"""(() => {
+  const reload = (sel) => {
+    const e = document.querySelector(sel);
+    if (!e) return 'no-el';
+    if (e.naturalWidth > 0) return 'already';
+    const u = e.src || '';
+    if (!u) return 'no-src';
+    e.removeAttribute('src');
+    e.src = u;                 // 同 URL 重载：不改 src 来源，无篡改信号
+    return 'reload';
+  };
+  return {img: reload('#aliyunCaptcha-img'),
+          puzzle: reload('#aliyunCaptcha-puzzle')};
 })()"""
 
 
@@ -268,18 +296,26 @@ class AliyunSliderCDP:
         return False
 
     def heal_images(self, bg, pz) -> bool:
-        """把图注入回 ``<img>``，逼组件进入可拖状态。
+        """图真没加载（naturalWidth==0）才修，且优先无篡改手段。
 
-        比特浏览器会拦 ``<img>`` 的加载（naturalWidth 恒 0），组件因此一直
-        停在 ``pointer-events:none`` / ``slider-move initial``，怎么拖都没反应。
-        我们已经在 Python 侧拿到了图，直接以 dataURL 注回去。
+        旧版只要 JS_ARMED 为 False 就把 src 改写 dataURL——但 initial 只是
+        空闲标记（空闲态可拖），于是每轮都不必要地篡改组件 DOM，src 来源
+        异常成为风控可检测信号（2026-11-18 取证：注入轮 100% 吃九宫格）。
+        现顺序：① 图已加载直接返回；② 同 URL 重载；③ 仍失败才 dataURL 兜底。
         """
         import json as _json
 
+        loaded = self.page.eval(JS_IMG_LOADED) or {}
+        if int(loaded.get("img") or 0) > 0 and int(loaded.get("pz") or 0) > 0:
+            return True
+        reloaded = self.page.eval(JS_RELOAD_IMAGES) or {}
+        self._d(f"同 URL 重载: {reloaded}")
+        if self.page.wait_js(JS_IMG_LOADED_OK, timeout=5):
+            return True
         try:
             args = {"bg": _img_to_data_url(bg), "pz": _img_to_data_url(pz)}
             out = self.page.eval(f"({JS_INJECT_IMAGES})({_json.dumps(args)})")
-            self._d(f"注入图片: {out}")
+            self._d(f"重载无效，兜底注入图片: {out}")
         except Exception as exc:
             self._d(f"注入失败: {type(exc).__name__}: {exc}")
             return False
@@ -371,13 +407,14 @@ class AliyunSliderCDP:
                     limit = max(0.0, disp_w - pw * scale)
                     x_left = min(max(0.0, x_left), limit)
                     dy = sol.y - bbox_y
-                    self._d(f"2Captcha x={sol.x:.0f} y={sol.y:.0f} "
+                    prov = getattr(self.paid, "name", "2captcha")
+                    self._d(f"{prov} x={sol.x:.0f} y={sol.y:.0f} "
                             f"(bbox_y={bbox_y} dy={dy:.0f}≈半高"
                             f"{pz_c.size[1] // 2}→中心) → 左沿 {x_left:.1f}"
                             f" 耗时={sol.elapsed:.1f}s cost=${sol.cost:.4f}"
                             f"{' 重试' + str(try_i - 1) if try_i > 1 else ''}")
-                    return x_left, f"2captcha(c={sol.x:.0f})", sol.cost
-                self._d(f"2Captcha 失败（第 {try_i}/3）: {sol.error}")
+                    return x_left, f"{prov}(c={sol.x:.0f})", sol.cost
+                self._d(f"打码失败（第 {try_i}/3）: {sol.error}")
             if try_i < 3:
                 time.sleep(1.5)
         return None
@@ -537,8 +574,9 @@ class AliyunSliderCDP:
                 self.refresh()
                 continue
             bg0, pz0, _d0 = got
-            # 组件没 arm（pointer-events:none / slider-move initial）时，把图注回去
-            if not self.page.wait_js(JS_ARMED, timeout=1):
+            # 图真没加载才修；空闲态 initial 不再触发注入（避免无谓 DOM 篡改）
+            loaded = self.page.eval(JS_IMG_LOADED) or {}
+            if int(loaded.get("img") or 0) <= 0 or int(loaded.get("pz") or 0) <= 0:
                 self.heal_images(bg0, pz0)
 
             ident = self.identify(got)   # 只走 2Captcha

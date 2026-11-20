@@ -1,14 +1,13 @@
-"""2Captcha 点选类验证码（ClickCaptcha / CoordinatesTask）。
+"""2Captcha 点选类验证码（GridTask / CoordinatesTask）。
 
-与 ``DragAndDropTask`` 的区别：
-- DragAndDrop 返回「拼图块目标坐标」一个点
-- CoordinatesTask 返回**多个点击点**，适合「九宫格里选出符合描述的所有图」
+九宫格首选 **GridTask**：工人对着带编号的格子直接返回格号
+（1 起，左上=1），无坐标→格子换算误差，实测比 CoordinatesTask 稳。
+CoordinatesTask 保留作回退（返回多个点击点）。
 
-2Captcha 接口：``POST /createTask`` type=``CoordinatesTask``
-  body        : base64 PNG（不带 data: 前缀）
-  comment     : 给打码员的说明（中文/英文都行）
-  imgInstructions : 可选，额外提示图
-返回：``solution.coordinates = [{"x":..,"y":..}, ...]``
+2Captcha 接口：``POST /createTask``
+  GridTask        : body + rows/columns + comment/imgInstructions + canNoAnswer
+  CoordinatesTask : body + comment + imgInstructions
+返回：``solution.click = [格号...]`` / ``solution.coordinates = [{x,y}...]``
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ class ClickTaskError(RuntimeError):
 class ClickSolution:
     ok: bool
     points: list[tuple[float, float]] = field(default_factory=list)
+    cells: list[int] = field(default_factory=list)   # GridTask 格号（1 起）
     cost: float = 0.0
     elapsed: float = 0.0
     error: str = ""
@@ -125,6 +125,59 @@ class TwoCaptchaClick:
             if r.get("status") != "ready":
                 raise ClickTaskError(f"未知状态 {r.get('status')}")
             return str((r.get("solution") or {}).get("text") or "")
+        raise ClickTaskError(f"超时 {self.timeout}s")
+
+    def solve_grid(self, image, comment: str,
+                   img_instructions: bytes | None = None,
+                   rows: int = 3, columns: int = 3) -> ClickSolution:
+        """GridTask：九宫格专用，工人直接返回格号（1 起）。
+
+        canNoAnswer=1：允许「没有符合的图」（Baxia 会出现空答案题），
+        此时 solution.click 为 No_matching_images → cells=[]。
+        """
+        task = {
+            "type": "GridTask",
+            "body": base64.b64encode(_as_png_bytes(image)).decode(),
+            "comment": comment,
+            "rows": rows,
+            "columns": columns,
+            "canNoAnswer": 1,
+        }
+        if img_instructions:
+            task["imgInstructions"] = base64.b64encode(
+                img_instructions).decode()
+        d = self._post(CREATE, {"clientKey": self.api_key, "task": task})
+        if d.get("errorId", 1) != 0:
+            raise ClickTaskError(d.get("errorDescription") or "建任务失败",
+                                 str(d.get("errorCode", "")))
+        task_id = d.get("taskId")
+        if not task_id:
+            raise ClickTaskError("未返回 taskId")
+        t0 = time.time()
+        while time.time() - t0 < self.timeout:
+            time.sleep(self.poll)
+            r = self._post(RESULT, {"clientKey": self.api_key,
+                                    "taskId": task_id})
+            if r.get("errorId", 1) != 0:
+                raise ClickTaskError(r.get("errorDescription") or "查询失败",
+                                     str(r.get("errorCode", "")))
+            status = r.get("status")
+            if status == "processing":
+                continue
+            if status != "ready":
+                raise ClickTaskError(f"未知状态 {status}")
+            sol = r.get("solution") or {}
+            click = sol.get("click")
+            cost = float(r.get("cost") or 0)
+            if isinstance(click, str):
+                if "no_matching" in click.lower():
+                    return ClickSolution(ok=True, cells=[], cost=cost,
+                                         elapsed=time.time() - t0, raw=r)
+                raise ClickTaskError(f"GridTask 异常答案: {click}")
+            cells = [int(c) for c in (click or [])
+                     if str(c).isdigit() and 1 <= int(c) <= rows * columns]
+            return ClickSolution(ok=True, cells=cells, cost=cost,
+                                 elapsed=time.time() - t0, raw=r)
         raise ClickTaskError(f"超时 {self.timeout}s")
 
     def solve(self, image, comment: str,

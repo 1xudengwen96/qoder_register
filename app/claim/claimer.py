@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import subprocess
@@ -103,6 +104,26 @@ class Claimer:
         self._proc: subprocess.Popen | None = None
 
     # ---------------------------------------------------------- 客户端控制
+    def _client_pids(self) -> list[int]:
+        r"""按安装路径精确匹配被测客户端进程（含 helper）。
+
+        不能按镜像名：Qoder IDE 的伴随进程也叫 Qoder.exe
+        （D:\Qoder IDE\resources\...），按名杀会误杀用户 IDE、
+        按名判活会把 IDE 伴随进程误认为客户端在跑。
+        """
+        if os.name != "nt":
+            return []
+        install = str(Path(self.client_path).parent).replace("'", "''")
+        cmd = ("Get-CimInstance Win32_Process | Where-Object { "
+               f"$_.ExecutablePath -like '{install}\\*' }} | "
+               "ForEach-Object { $_.ProcessId }")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                                 capture_output=True, text=True, timeout=20)
+            return [int(x) for x in (out.stdout or "").split() if x.strip().isdigit()]
+        except Exception:  # noqa: BLE001
+            return []
+
     def is_running(self) -> bool:
         if os.name != "nt":
             try:
@@ -111,17 +132,10 @@ class Claimer:
                 return out.returncode == 0
             except Exception:
                 return False
-        try:
-            # 中文 Windows tasklist 输出 GBK；默认 utf-8 解码会让 stdout 变 None
-            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Qoder.exe", "/NH"],
-                                 capture_output=True, text=True, timeout=15,
-                                 encoding="gbk", errors="replace")
-            return "Qoder.exe" in (out.stdout or "")
-        except Exception:
-            return False
+        return bool(self._client_pids())
 
     def kill(self, timeout: int = 20) -> bool:
-        """结束所有 Qoder 进程（含 helper）。"""
+        """结束被测客户端进程（含 helper），按安装路径精确匹配，不碰 IDE。"""
         if self._proc is not None:
             try:
                 self._proc.terminate()
@@ -131,9 +145,9 @@ class Claimer:
             self._proc = None
 
         if os.name == "nt":
-            for name in ("Qoder.exe", "Qoder Helper.exe"):
+            for pid in self._client_pids():
                 try:
-                    subprocess.run(["taskkill", "/F", "/IM", name, "/T"],
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"],
                                    capture_output=True, text=True, timeout=15)
                 except Exception:
                     pass
@@ -162,9 +176,14 @@ class Claimer:
 
             # 必须剔除 ELECTRON_RUN_AS_NODE：否则 Electron 会以 node 身份跑，
             # 无参数时读 stdin 到 EOF 直接退 0，看起来像"启动后立刻退出"。
+            # detach + breakaway：前台命令结束时进程树被回收会把客户端
+            # 一起带走（实测客户端随启动它的 python 退出而死）。
+            flags = 0
+            if os.name == "nt":
+                flags = (0x00000008 | 0x00000200 | 0x01000000)  # DETACHED|NEW_GROUP|BREAKAWAY
             self._proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=str(exe.parent), env=clean_env(),
+                cwd=str(exe.parent), env=clean_env(), creationflags=flags,
             )
             return True
         except Exception:
@@ -324,6 +343,21 @@ class Claimer:
 
             if token is None:
                 return ClaimResult(False, error="未抓到 token（客户端可能未登录）")
+
+            # 3.5 客户端收尾：清新手引导/促销弹层 + 尝试领权益。
+            # 试用/新手礼跟设备新手卡绑定，重置已删 onboarding 状态，
+            # 这里完成跳过与领取动作（best-effort，不阻断主流程）
+            if self.login_mode == "cdp":
+                try:
+                    from app.claim.ui_login import (claim_client_campaign,
+                                                    dismiss_client_overlays)
+                    # 贺屏领取按钮可能在引导层上：先扫领→清弹层→再扫
+                    claim_client_campaign()
+                    dismiss_client_overlays()
+                    claim_client_campaign()
+                except Exception as exc:  # noqa: BLE001
+                    logging.getLogger("qoder_register").warning(
+                        "客户端弹层/权益处理异常：%s", exc)
 
             # 4. 核对额度
             credits, plan, expire = self.probe_credits(token)
